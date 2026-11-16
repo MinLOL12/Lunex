@@ -1,0 +1,38 @@
+{
+  "name": "lunex",
+  "version": "1.0.0",
+  "description": "Lightweight desktop application for managing Steam games, Lua manifests, and depot files.",
+  "main": "dist-electron/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 5173",
+    "build:web": "tsc -b && vite build",
+    "build:electron": "tsc -p tsconfig.electron.json && node -e \"import('node:fs').then(fs=>fs.copyFileSync('electron/preload.cjs','dist-electron/preload.cjs'))\"",
+    "build": "npm run build:web && npm run build:electron",
+    "electron:dev": "npm run build:electron && concurrently -k \"vite --port 5173\" \"wait-on http://127.0.0.1:5173 && electron .\"",
+    "electron:build": "npm run build && electron-builder --win",
+    "preview": "vite preview --host 0.0.0.0 --port 4173",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.475.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.9",
+    "@types/node": "^22.13.5",
+    "@types/react": "^19.0.10",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "electron": "^34.2.0",
+    "electron-builder": "^25.1.8",
+    "tailwindcss": "^4.0.9",
+    "typescript": "^5.7.3",
+    "vite": "^6.2.0",
+    "vitest": "^3.0.7",
+    "wait-on": "^8.0.2"
+  }
+}

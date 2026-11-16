@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none">
+  <defs>
+    <linearGradient id="lunexGrad" x1="8" y1="6" x2="56" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#818CF8"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="16" fill="#11141C"/>
+  <rect x="1" y="1" width="62" height="62" rx="15" stroke="white" stroke-opacity="0.09" stroke-width="2"/>
+  <path d="M36.5 14C24.626 14 15 23.626 15 35.5C15 44.365 20.365 51.976 28.02 55.26C29.88 56.058 32.02 56.5 34.27 56.5C43.59 56.5 51.4 50.12 53.5 41.5C49.68 44.12 45.05 45.65 40.06 45.65C28.74 45.65 19.56 36.47 19.56 25.15C19.56 20.99 20.8 17.12 22.93 13.89C27.08 12.66 31.66 14 36.5 14Z" fill="url(#lunexGrad)"/>
+  <circle cx="43" cy="23" r="4.5" fill="#38BDF8" fill-opacity="0.9"/>
+</svg>
