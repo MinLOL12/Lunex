@@ -1,0 +1,93 @@
+name: Package Windows EXE
+
+on:
+  push:
+    branches:
+      - main
+      - 'arena/**'
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: 'Publish packaged .exe files to a GitHub Release'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows Installer & Portable EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run automated tests
+        run: npm test
+
+      - name: Build and package Windows .exe
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run electron:build
+
+      - name: Verify .exe output and generate checksums
+        shell: pwsh
+        run: |
+          $exes = Get-ChildItem -Path "release/*" -Filter "*.exe" | Where-Object { $_.Name -notlike "*__uninstaller*" }
+          if (-not $exes -or $exes.Count -eq 0) {
+            Write-Error "No .exe artifacts were generated in release/"
+            exit 1
+          }
+          "### Packaged Windows Executables" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "| File | Size (MB) | SHA-256 |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "| --- | --- | --- |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          foreach ($file in $exes) {
+            $sizeMb = [math]::Round($file.Length / 1MB, 2)
+            $hash = (Get-FileHash -Path $file.FullName -Algorithm SHA256).Hash.ToLower()
+            Write-Host "Built: $($file.Name) ($sizeMb MB) - sha256:$hash"
+            "| ``$($file.Name)`` | $sizeMb MB | ``$hash`` |" | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          }
+
+      - name: Upload Windows .exe Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Lunex-Windows-x64-EXE
+          path: |
+            release/*/*.exe
+            !release/*/*__uninstaller*.exe
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release (on version tag or manual dispatch)
+        if: startsWith(github.ref, 'refs/tags/v') || inputs.create_release == true
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $pkg = Get-Content -Raw -Path "package.json" | ConvertFrom-Json
+          $tag = if ("${{ github.ref }}" -like "refs/tags/v*") { "${{ github.ref_name }}" } else { "v$($pkg.version)" }
+          $files = Get-ChildItem -Path "release/$($pkg.version)" -Filter "*.exe" | ForEach-Object { $_.FullName }
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag $files --clobber
+          } else {
+            gh release create $tag $files --title "Lunex $tag" --generate-notes
+          }

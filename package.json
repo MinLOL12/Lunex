@@ -2,15 +2,20 @@
   "name": "lunex",
   "version": "1.0.0",
   "description": "Lightweight desktop application for managing Steam games, Lua manifests, and depot files.",
+  "author": {
+    "name": "Lunex Contributors",
+    "email": "noreply@github.com"
+  },
+  "homepage": "https://github.com/MinLOL12/Lunex",
   "main": "dist-electron/main.js",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 5173",
     "build:web": "tsc -b && vite build",
-    "build:electron": "tsc -p tsconfig.electron.json && node -e \"import('node:fs').then(fs=>fs.copyFileSync('electron/preload.cjs','dist-electron/preload.cjs'))\"",
+    "build:electron": "tsc -p tsconfig.electron.json && node scripts/copy-preload.mjs",
     "build": "npm run build:web && npm run build:electron",
     "electron:dev": "npm run build:electron && concurrently -k \"vite --port 5173\" \"wait-on http://127.0.0.1:5173 && electron .\"",
-    "electron:build": "npm run build && electron-builder --win",
+    "electron:build": "npm run build && electron-builder --win --publish never",
     "preview": "vite preview --host 0.0.0.0 --port 4173",
     "test": "vitest run"
   },
