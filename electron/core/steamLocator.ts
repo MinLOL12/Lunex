@@ -1,8 +1,9 @@
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { buildValidDepotManifestBuffer } from './validator.js';
+import { clearLoginUsersOfflineMode, parseVdf } from './vdfParser.js';
 
 export const KNOWN_STEAM_TITLES: Record<string, string> = {
   '1091500': 'Cyberpunk 2077',
@@ -47,25 +48,83 @@ function isValidSteamDirectory(dirPath: string): boolean {
   }
 }
 
-function queryWindowsSteamRegistry(): string | null {
+/**
+ * On Windows, queries HKCU\Software\Valve\Steam\ActiveProcess to find the EXACT
+ * directory of the currently running Steam instance (prevents multi-install mismatches).
+ */
+export function getRunningSteamPath(): string | null {
   if (process.platform !== 'win32') return null;
 
-  const queries = [
-    'reg query "HKCU\\Software\\Valve\\Steam" /v SteamPath',
-    'reg query "HKLM\\SOFTWARE\\WOW6432Node\\Valve\\Steam" /v InstallPath',
-    'reg query "HKLM\\SOFTWARE\\Valve\\Steam" /v InstallPath',
-  ];
-
-  for (const cmd of queries) {
-    try {
-      const output = execSync(cmd, {
+  try {
+    const pidOut = execSync(
+      'reg query "HKCU\\Software\\Valve\\Steam\\ActiveProcess" /v pid',
+      {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
         timeout: 2500,
+        windowsHide: true,
+      }
+    );
+    const pidMatch = /REG_DWORD\s+0x([0-9a-fA-F]+)/i.exec(pidOut);
+    const pid = pidMatch ? Number.parseInt(pidMatch[1], 16) : 0;
+    if (!pid || pid <= 0) return null;
+
+    const dllOut = execSync(
+      'reg query "HKCU\\Software\\Valve\\Steam\\ActiveProcess" /v SteamClientDll',
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2500,
+        windowsHide: true,
+      }
+    );
+    const dllMatch = /REG_(?:EXPAND_)?SZ\s+(.+)$/m.exec(dllOut);
+    if (dllMatch && dllMatch[1]) {
+      const dir = path.dirname(path.normalize(dllMatch[1].trim()));
+      if (isValidSteamDirectory(dir)) {
+        return dir;
+      }
+    }
+  } catch {
+    // ActiveProcess unavailable
+  }
+  return null;
+}
+
+function queryWindowsSteamRegistry(): string | null {
+  if (process.platform !== 'win32') return null;
+
+  // Prefer the currently running Steam instance if available
+  const activePath = getRunningSteamPath();
+  if (activePath) return activePath;
+
+  const queries = [
+    { cmd: 'reg query "HKCU\\Software\\Valve\\Steam" /v SteamPath', isExe: false },
+    { cmd: 'reg query "HKCU\\Software\\Valve\\Steam" /v SteamExe', isExe: true },
+    {
+      cmd: 'reg query "HKLM\\SOFTWARE\\WOW6432Node\\Valve\\Steam" /v InstallPath',
+      isExe: false,
+    },
+    {
+      cmd: 'reg query "HKLM\\SOFTWARE\\Valve\\Steam" /v InstallPath',
+      isExe: false,
+    },
+  ];
+
+  for (const q of queries) {
+    try {
+      const output = execSync(q.cmd, {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 2500,
+        windowsHide: true,
       });
-      const match = /REG_SZ\s+(.+)$/m.exec(output);
+      const match = /REG_(?:EXPAND_)?SZ\s+(.+)$/m.exec(output);
       if (match && match[1]) {
-        const normalized = path.normalize(match[1].trim());
+        let normalized = path.normalize(match[1].trim());
+        if (q.isExe) {
+          normalized = path.dirname(normalized);
+        }
         if (isValidSteamDirectory(normalized)) {
           return normalized;
         }
@@ -75,6 +134,288 @@ function queryWindowsSteamRegistry(): string | null {
     }
   }
   return null;
+}
+
+export function isSteamProcessRunning(): boolean {
+  try {
+    if (process.platform === 'win32') {
+      const out = execSync('tasklist /FI "IMAGENAME eq steam.exe" /NH', {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 4000,
+        windowsHide: true,
+      });
+      return /steam\.exe/i.test(out);
+    }
+    const cmd =
+      process.platform === 'darwin' ? 'pgrep -x steam_osx' : 'pgrep -x steam';
+    execSync(cmd, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 2000,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const STEAM_PLUGIN_DLL_CANDIDATES = [
+  'xinput1_4.dll',
+  'hid.dll',
+  'dwmapi.dll',
+  'version.dll',
+  'winmm.dll',
+  'user32.dll',
+  'dxgi.dll',
+  'SteamTools.dll',
+  'stUI.dll',
+  'core.dll',
+  'GreenLuma_2024_x64.dll',
+  'GreenLuma_2024_x86.dll',
+  'DLLInjector.exe',
+];
+
+export function detectSteamPlugins(steamRoot: string): {
+  detected: boolean;
+  files: string[];
+} {
+  const found: string[] = [];
+  if (!steamRoot || !fs.existsSync(steamRoot)) {
+    return { detected: false, files: [] };
+  }
+  const candidateLower = new Set(
+    STEAM_PLUGIN_DLL_CANDIDATES.map((c) => c.toLowerCase())
+  );
+  try {
+    for (const entry of fs.readdirSync(steamRoot)) {
+      if (candidateLower.has(entry.toLowerCase())) {
+        found.push(entry);
+      }
+    }
+  } catch {
+    // Ignore inaccessible directory
+  }
+  // Also recognize GreenLuma AppList folder if non-empty
+  try {
+    const appListDir = path.join(steamRoot, 'AppList');
+    if (
+      fs.existsSync(appListDir) &&
+      fs.statSync(appListDir).isDirectory() &&
+      fs.readdirSync(appListDir).some((f) => f.toLowerCase().endsWith('.txt'))
+    ) {
+      found.push('AppList/');
+    }
+  } catch {
+    // Ignore
+  }
+
+  return {
+    detected: found.length > 0,
+    files: found,
+  };
+}
+
+export function checkSteamOfflineConfig(steamRoot: string): boolean {
+  try {
+    const steamCfg = path.join(steamRoot, 'steam.cfg');
+    if (fs.existsSync(steamCfg)) {
+      const content = fs.readFileSync(steamCfg, 'utf8');
+      if (/^\s*ForceOfflineMode\s*=\s*(1|true|enable)/im.test(content)) {
+        return true;
+      }
+    }
+
+    const loginUsersPath = path.join(steamRoot, 'config', 'loginusers.vdf');
+    if (fs.existsSync(loginUsersPath)) {
+      const parsed = parseVdf(fs.readFileSync(loginUsersPath, 'utf8'));
+      const usersKey = Object.keys(parsed).find(
+        (k) => k.toLowerCase() === 'users'
+      );
+      const users = usersKey ? parsed[usersKey] : undefined;
+      if (users && typeof users === 'object') {
+        const userList = Object.values(users).filter(
+          (e): e is Record<string, string> => Boolean(e && typeof e === 'object')
+        );
+        const hasMostRecent = userList.some((entry) =>
+          Object.entries(entry).some(
+            ([k, v]) => k.toLowerCase() === 'mostrecent' && v === '1'
+          )
+        );
+        for (const entry of userList) {
+          const mostRecent = Object.entries(entry).find(
+            ([k]) => k.toLowerCase() === 'mostrecent'
+          )?.[1];
+          const wantsOffline = Object.entries(entry).find(
+            ([k]) => k.toLowerCase() === 'wantsofflinemode'
+          )?.[1];
+          if ((!hasMostRecent || mostRecent === '1') && wantsOffline === '1') {
+            return true;
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore malformed Steam config
+  }
+  return false;
+}
+
+/**
+ * Clears ForceOfflineMode in `steam.cfg` and WantsOfflineMode in `config/loginusers.vdf`.
+ * Must be called while Steam is stopped so Steam does not overwrite loginusers.vdf on exit.
+ */
+export function clearSteamOfflineConfig(
+  steamRoot: string,
+  backupCallback?: (filePath: string) => void
+): { changedFiles: string[] } {
+  const changedFiles: string[] = [];
+
+  const steamCfg = path.join(steamRoot, 'steam.cfg');
+  if (fs.existsSync(steamCfg)) {
+    try {
+      const content = fs.readFileSync(steamCfg, 'utf8');
+      if (/^\s*ForceOfflineMode\s*=\s*(1|true|enable)/im.test(content)) {
+        backupCallback?.(steamCfg);
+        const updated = content.replace(
+          /^(\s*)ForceOfflineMode\s*=\s*(1|true|enable)\s*$/gim,
+          '$1ForceOfflineMode=disable'
+        );
+        if (updated !== content) {
+          fs.writeFileSync(steamCfg, updated, 'utf8');
+          changedFiles.push('steam.cfg');
+        }
+      }
+    } catch {
+      // Ignore locked steam.cfg
+    }
+  }
+
+  const loginUsersPath = path.join(steamRoot, 'config', 'loginusers.vdf');
+  if (fs.existsSync(loginUsersPath)) {
+    try {
+      const content = fs.readFileSync(loginUsersPath, 'utf8');
+      const cleared = clearLoginUsersOfflineMode(content);
+      if (cleared.changed) {
+        backupCallback?.(loginUsersPath);
+        fs.writeFileSync(loginUsersPath, cleared.updatedContent, 'utf8');
+        changedFiles.push('config/loginusers.vdf');
+      }
+    } catch {
+      // Ignore locked loginusers.vdf
+    }
+  }
+
+  return { changedFiles };
+}
+
+function resolveSteamExecutable(steamRoot: string): string | null {
+  if (process.platform === 'win32') {
+    const exe = path.join(steamRoot, 'steam.exe');
+    return fs.existsSync(exe) ? exe : null;
+  }
+  if (process.platform === 'darwin') {
+    return '/Applications/Steam.app/Contents/MacOS/steam_osx';
+  }
+  return 'steam';
+}
+
+/**
+ * Gracefully stops Steam and waits until steam.exe is completely exited so
+ * config.vdf, appmanifest_*.acf, and appcache/httpcache edits cannot be overwritten.
+ */
+export async function stopSteamClient(
+  steamRoot: string
+): Promise<{ stopped: boolean; wasRunning: boolean }> {
+  if (!isSteamProcessRunning()) {
+    return { stopped: true, wasRunning: false };
+  }
+
+  const steamExe = resolveSteamExecutable(steamRoot);
+
+  try {
+    if (steamExe) {
+      if (process.platform === 'win32') {
+        spawn(steamExe, ['-shutdown'], {
+          detached: true,
+          stdio: 'ignore',
+          windowsHide: true,
+        }).unref();
+      } else {
+        execSync('steam -shutdown', { stdio: 'ignore', timeout: 3000 });
+      }
+    }
+  } catch {
+    // Proceed to polling/fallback kill
+  }
+
+  // Wait up to 10s for clean shutdown (so Steam flushes cleanly BEFORE we edit config.vdf)
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    if (!isSteamProcessRunning()) break;
+  }
+
+  if (process.platform === 'win32' && isSteamProcessRunning()) {
+    try {
+      execSync('taskkill /F /IM steam.exe /T', {
+        stdio: 'ignore',
+        timeout: 5000,
+        windowsHide: true,
+      });
+    } catch {
+      // Ignore taskkill errors
+    }
+    try {
+      execSync('taskkill /F /IM steamwebhelper.exe', {
+        stdio: 'ignore',
+        timeout: 3000,
+        windowsHide: true,
+      });
+    } catch {
+      // Already exited
+    }
+
+    for (let i = 0; i < 8; i++) {
+      await new Promise((r) => setTimeout(r, 500));
+      if (!isSteamProcessRunning()) break;
+    }
+  }
+
+  const stopped = !isSteamProcessRunning();
+  if (stopped) {
+    // Allow Windows to release file handles on config.vdf / downloading / httpcache
+    await new Promise((r) => setTimeout(r, 750));
+  }
+
+  return { stopped, wasRunning: true };
+}
+
+/**
+ * Launches Steam cleanly without passing premature steam://install args during cold boot
+ * (letting Steam sign in and load SteamTools/stplug-in hooks first).
+ */
+export function startSteamClient(steamRoot: string): boolean {
+  try {
+    const steamExe = resolveSteamExecutable(steamRoot);
+    if (!steamExe) return false;
+
+    const child = spawn(steamExe, [], {
+      cwd: fs.existsSync(steamRoot) ? steamRoot : undefined,
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export async function restartSteamClient(steamRoot: string): Promise<boolean> {
+  const { stopped } = await stopSteamClient(steamRoot);
+  if (!stopped) return false;
+  return startSteamClient(steamRoot);
 }
 
 export interface LocatedSteamResult {
@@ -87,13 +428,11 @@ export interface LocatedSteamResult {
  * Falls back to a pre-seeded local sandbox Steam directory only when no system Steam exists.
  */
 export function locateSteamDirectory(sandboxRoot: string): LocatedSteamResult {
-  // 1. Windows Registry check
   const regPath = queryWindowsSteamRegistry();
   if (regPath) {
     return { steamPath: regPath, isSimulated: false };
   }
 
-  // 2. Standard OS installation paths
   const home = os.homedir();
   const candidates =
     process.platform === 'win32'
@@ -109,7 +448,15 @@ export function locateSteamDirectory(sandboxRoot: string): LocatedSteamResult {
         : [
             path.join(home, '.steam', 'steam'),
             path.join(home, '.local', 'share', 'Steam'),
-            path.join(home, '.var', 'app', 'com.valvesoftware.Steam', '.local', 'share', 'Steam'),
+            path.join(
+              home,
+              '.var',
+              'app',
+              'com.valvesoftware.Steam',
+              '.local',
+              'share',
+              'Steam'
+            ),
           ];
 
   for (const candidate of candidates) {
@@ -118,7 +465,6 @@ export function locateSteamDirectory(sandboxRoot: string): LocatedSteamResult {
     }
   }
 
-  // 3. Provision realistic sandbox Steam structure for preview / development environments
   const simulatedSteamPath = path.join(sandboxRoot, 'Steam');
   ensureSimulatedSteamSeeded(simulatedSteamPath);
   return { steamPath: simulatedSteamPath, isSimulated: true };
@@ -126,7 +472,8 @@ export function locateSteamDirectory(sandboxRoot: string): LocatedSteamResult {
 
 /**
  * Seeds a realistic Steam folder structure (libraryfolders.vdf, appmanifest_*.acf,
- * config/stplug-in/*.lua, depotcache/*.manifest) once when running without a real Steam install.
+ * config/stplug-in/*.lua, depotcache/*.manifest, config/depotcache/*.manifest) once
+ * when running without a real Steam install.
  */
 export function ensureSimulatedSteamSeeded(steamRoot: string): void {
   const markerFile = path.join(steamRoot, '.lunex-seeded');
@@ -136,12 +483,13 @@ export function ensureSimulatedSteamSeeded(steamRoot: string): void {
   const commonDir = path.join(steamappsDir, 'common');
   const luaDir = path.join(steamRoot, 'config', 'stplug-in');
   const depotCacheDir = path.join(steamRoot, 'depotcache');
+  const configDepotCacheDir = path.join(steamRoot, 'config', 'depotcache');
 
   fs.mkdirSync(commonDir, { recursive: true });
   fs.mkdirSync(luaDir, { recursive: true });
   fs.mkdirSync(depotCacheDir, { recursive: true });
+  fs.mkdirSync(configDepotCacheDir, { recursive: true });
 
-  // Write authentic libraryfolders.vdf
   const escapedRoot = steamRoot.replace(/\\/g, '\\\\');
   const libraryFoldersVdf = `"libraryfolders"
 {
@@ -160,9 +508,12 @@ export function ensureSimulatedSteamSeeded(steamRoot: string): void {
 \t}
 }
 `;
-  fs.writeFileSync(path.join(steamappsDir, 'libraryfolders.vdf'), libraryFoldersVdf, 'utf8');
+  fs.writeFileSync(
+    path.join(steamappsDir, 'libraryfolders.vdf'),
+    libraryFoldersVdf,
+    'utf8'
+  );
 
-  // Seed installed Steam appmanifest_*.acf files
   const sampleApps = [
     {
       appId: '1091500',
@@ -192,7 +543,7 @@ export function ensureSimulatedSteamSeeded(steamRoot: string): void {
       appId: '1145350',
       name: 'Hades II',
       installdir: 'Hades II',
-      stateFlags: '6', // Update Required
+      stateFlags: '6',
       sizeOnDisk: '9841209344',
       lastUpdated: '1763011500',
     },
@@ -226,7 +577,6 @@ export function ensureSimulatedSteamSeeded(steamRoot: string): void {
     );
   }
 
-  // Seed authentic .lua manifests in config/stplug-in
   const cyberpunkLua = `-- Lunex Managed Manifest: Cyberpunk 2077 (1091500)
 addappid(1091500)
 addappid(1091501, 1, "8f3c4a1290e7b451c209de78a12b49087712fa980c41e2b39d08112ac76e4501")
@@ -245,7 +595,6 @@ setManifestid(2778580, "3847561029384756102", 0)
 `;
   fs.writeFileSync(path.join(luaDir, '1245620.lua'), eldenRingLua, 'utf8');
 
-  // Also seed a Lua manifest for a game not yet installed via ACF (Black Myth: Wukong - 2358720)
   const wukongLua = `-- Lunex Managed Manifest: Black Myth: Wukong (2358720)
 addappid(2358720)
 addappid(2358721, 1, "4d18a920bc34ef5678901234ab56cd78ef901234ab56cd78ef901234ab56cd78")
@@ -253,7 +602,6 @@ setManifestid(2358721, "9182736450192837465", 0)
 `;
   fs.writeFileSync(path.join(luaDir, '2358720.lua'), wukongLua, 'utf8');
 
-  // Seed binary .manifest files in depotcache with valid Valve DepotManifest headers
   const sampleDepots = [
     { depotId: '1091501', manifestId: '7829401928374651092' },
     { depotId: '2138330', manifestId: '4910293847561029384' },
@@ -263,10 +611,9 @@ setManifestid(2358721, "9182736450192837465", 0)
 
   for (const d of sampleDepots) {
     const buf = buildValidDepotManifestBuffer(d.depotId, d.manifestId);
-    fs.writeFileSync(
-      path.join(depotCacheDir, `${d.depotId}_${d.manifestId}.manifest`),
-      buf
-    );
+    const name = `${d.depotId}_${d.manifestId}.manifest`;
+    fs.writeFileSync(path.join(depotCacheDir, name), buf);
+    fs.writeFileSync(path.join(configDepotCacheDir, name), buf);
   }
 
   fs.writeFileSync(markerFile, new Date().toISOString(), 'utf8');

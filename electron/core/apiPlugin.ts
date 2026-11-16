@@ -2,7 +2,11 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import path from 'node:path';
 import type { Plugin } from 'vite';
 import { LunexManager } from './lunexManager.js';
-import type { IncomingFilePayload, LunexSettings } from './types.js';
+import type {
+  IncomingFilePayload,
+  LunexSettings,
+  RepairInstallOptions,
+} from './types.js';
 import { buildValidDepotManifestBuffer } from './validator.js';
 
 function readJsonBody(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -80,11 +84,33 @@ export function lunexApiPlugin(dataDir?: string): Plugin {
         return;
       }
 
+      if (method === 'POST' && pathname === '/api/unpack-zip') {
+        const body = await readJsonBody(req);
+        const files = (body.files as IncomingFilePayload[]) ?? [];
+        sendJson(res, 200, manager.unpackZipFiles(files));
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/api/repair-install') {
+        const body = await readJsonBody(req);
+        const appId = String(body.appId ?? '');
+        const options = body.options as RepairInstallOptions | undefined;
+        sendJson(res, 200, await manager.repairGameInstall(appId, options));
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/api/live-app-info') {
+        const body = await readJsonBody(req);
+        const appId = String(body.appId ?? '');
+        sendJson(res, 200, await manager.checkLiveAppInfo(appId));
+        return;
+      }
+
       if (method === 'POST' && pathname === '/api/import') {
         const body = await readJsonBody(req);
         const files = (body.files as IncomingFilePayload[]) ?? [];
         const options = body.options as
-          | { allowReplaceDuplicates?: boolean }
+          | { allowReplaceDuplicates?: boolean; syncLuaDirectives?: boolean }
           | undefined;
         sendJson(res, 200, manager.importFiles(files, options));
         return;

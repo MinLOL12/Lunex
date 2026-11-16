@@ -10,6 +10,7 @@ import {
   Search,
   Trash2,
   Upload,
+  Wrench,
   X,
   XCircle,
 } from 'lucide-react';
@@ -40,6 +41,7 @@ interface ManifestsViewProps {
   onAssociateManifest: (filePath: string, appId: string) => Promise<void>;
   onDeleteManifest: (filePath: string) => Promise<void>;
   onInspectManifest: (manifest: ManagedManifest) => void;
+  onDiagnoseGame?: (game: SteamGame) => void;
 }
 
 type TypeFilter = 'all' | 'lua' | 'manifest' | 'issues';
@@ -58,6 +60,7 @@ export function ManifestsView({
   onAssociateManifest,
   onDeleteManifest,
   onInspectManifest,
+  onDiagnoseGame,
 }: ManifestsViewProps) {
   const [query, setQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
@@ -442,31 +445,59 @@ export function ManifestsView({
             </div>
           </div>
         ) : groupByGame ? (
-          grouped.map((group) => (
-            <div
-              key={group.appId}
-              className="rounded-2xl bg-[#121621] border border-white/[0.07] overflow-hidden"
-            >
-              <div className="px-4 py-2.5 bg-[#161B28] border-b border-white/[0.06] flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="text-xs font-semibold text-slate-100 truncate">
-                    {group.title}
-                  </span>
-                  {group.appId !== 'unassigned' && (
-                    <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-white/[0.06] text-slate-300">
-                      AppID {group.appId}
+          grouped.map((group) => {
+            const matchedGame = games.find((g) => g.appId === group.appId);
+            const groupDiag = matchedGame?.installDiagnostics;
+            return (
+              <div
+                key={group.appId}
+                className="rounded-2xl bg-[#121621] border border-white/[0.07] overflow-hidden"
+              >
+                <div className="px-4 py-2.5 bg-[#161B28] border-b border-white/[0.06] flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-xs font-semibold text-slate-100 truncate">
+                      {group.title}
                     </span>
-                  )}
+                    {group.appId !== 'unassigned' && (
+                      <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-white/[0.06] text-slate-300">
+                        AppID {group.appId}
+                      </span>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    {matchedGame && onDiagnoseGame && groupDiag && (
+                      <button
+                        type="button"
+                        onClick={() => onDiagnoseGame(matchedGame)}
+                        className={clsx(
+                          'inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium border transition-colors cursor-pointer',
+                          groupDiag.status === 'blocked'
+                            ? 'bg-rose-500/15 text-rose-200 border-rose-500/30 hover:bg-rose-500/25'
+                            : groupDiag.status === 'needs_attention'
+                              ? 'bg-amber-500/15 text-amber-200 border-amber-500/30 hover:bg-amber-500/25'
+                              : 'bg-emerald-500/12 text-emerald-300 border-emerald-500/25 hover:bg-emerald-500/20'
+                        )}
+                      >
+                        <Wrench className="w-3 h-3" />
+                        <span>
+                          {groupDiag.status === 'ready'
+                            ? 'Diagnostics'
+                            : 'Fix Install'}
+                        </span>
+                      </button>
+                    )}
+                    <span className="text-[11px] font-mono text-slate-400">
+                      {group.items.length} file
+                      {group.items.length === 1 ? '' : 's'}
+                    </span>
+                  </div>
                 </div>
-                <span className="text-[11px] font-mono text-slate-400">
-                  {group.items.length} file{group.items.length === 1 ? '' : 's'}
-                </span>
+                <div className="divide-y divide-white/[0.05]">
+                  {group.items.map(renderManifestRow)}
+                </div>
               </div>
-              <div className="divide-y divide-white/[0.05]">
-                {group.items.map(renderManifestRow)}
-              </div>
-            </div>
-          ))
+            );
+          })
         ) : (
           <div className="rounded-2xl bg-[#121621] border border-white/[0.07] divide-y divide-white/[0.05] overflow-hidden">
             {filtered.map(renderManifestRow)}

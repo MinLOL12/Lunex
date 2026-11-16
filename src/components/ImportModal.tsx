@@ -39,8 +39,10 @@ interface ImportModalProps {
   initialDroppedFiles?: File[];
   games: SteamGame[];
   autoBackup: boolean;
+  isSimulatedSteam?: boolean;
   onClose: () => void;
   onImported: (outcomes: ImportFileOutcome[]) => void;
+  onOpenSettings?: () => void;
 }
 
 export function ImportModal({
@@ -49,13 +51,16 @@ export function ImportModal({
   initialDroppedFiles,
   games,
   autoBackup,
+  isSimulatedSteam,
   onClose,
   onImported,
+  onOpenSettings,
 }: ImportModalProps) {
   const [staged, setStaged] = useState<StagedFile[]>([]);
   const [validating, setValidating] = useState(false);
   const [importing, setImporting] = useState(false);
   const [allowReplaceDuplicates, setAllowReplaceDuplicates] = useState(false);
+  const [syncLuaDirectives, setSyncLuaDirectives] = useState(true);
   const [isDragging, setIsDragging] = useState(false);
 
   // Optional inline Lua composer
@@ -130,14 +135,27 @@ export function ImportModal({
     const arr = Array.from(fileList);
     if (arr.length === 0) return;
 
-    const converted: StagedFile[] = await Promise.all(
+    const rawPayloads: IncomingFilePayload[] = await Promise.all(
       arr.map(async (f) => ({
-        id: `${f.name}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         fileName: f.name,
         base64Content: await fileToBase64(f),
-        targetAppId: defaultAppId || '',
+        targetAppId: defaultAppId || undefined,
       }))
     );
+
+    const hasZip = rawPayloads.some((p) =>
+      p.fileName.toLowerCase().endsWith('.zip')
+    );
+    const expanded = hasZip
+      ? await lunexClient.unpackZip(rawPayloads)
+      : rawPayloads;
+
+    const converted: StagedFile[] = expanded.map((p) => ({
+      id: `${p.fileName}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      fileName: p.fileName,
+      base64Content: p.base64Content,
+      targetAppId: p.targetAppId || defaultAppId || '',
+    }));
 
     const combined = [...staged, ...converted];
     await runValidation(combined);
@@ -196,6 +214,7 @@ export function ImportModal({
       }));
       const res = await lunexClient.importFiles(payloads, {
         allowReplaceDuplicates,
+        syncLuaDirectives,
       });
       onImported(res.outcomes);
       onClose();
@@ -274,6 +293,29 @@ export function ImportModal({
 
         {/* Body */}
         <div className="flex-1 overflow-y-auto p-5 space-y-4">
+          {isSimulatedSteam && (
+            <div className="flex items-start justify-between gap-3 p-3 rounded-xl bg-amber-500/12 border border-amber-500/30 text-xs text-amber-200">
+              <div className="flex items-start gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                <span>
+                  Lunex is currently pointed at the Sandbox preview folder instead of your real Steam folder. Point Lunex to your Steam installation in Settings so Steam sees these files.
+                </span>
+              </div>
+              {onOpenSettings && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    onOpenSettings();
+                  }}
+                  className="px-2.5 py-1 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 text-amber-100 text-[11px] font-medium shrink-0 cursor-pointer"
+                >
+                  Settings
+                </button>
+              )}
+            </div>
+          )}
+
           {mode === 'files' ? (
             <>
               {/* Dropzone */}
@@ -302,7 +344,7 @@ export function ImportModal({
                   ref={fileInputRef}
                   type="file"
                   multiple
-                  accept=".lua,.manifest"
+                  accept=".lua,.manifest,.zip"
                   className="hidden"
                   onChange={(e) => {
                     if (e.target.files?.length) {
@@ -315,11 +357,12 @@ export function ImportModal({
                   <FileCheck2 className="w-5 h-5" />
                 </div>
                 <p className="text-xs font-medium text-slate-200">
-                  Drop <span className="font-mono text-indigo-300">.lua</span> or{' '}
-                  <span className="font-mono text-sky-300">.manifest</span> files here, or click to browse
+                  Drop <span className="font-mono text-indigo-300">.lua</span>,{' '}
+                  <span className="font-mono text-sky-300">.manifest</span>, or{' '}
+                  <span className="font-mono text-emerald-300">.zip</span> packs here, or click to browse
                 </p>
                 <p className="text-[11px] text-slate-500 mt-1">
-                  Checks Valve DepotManifest headers, Lua syntax, SHA-256 duplicates, and AppID directives
+                  Unpacks .zip bundles, unwraps compressed manifests, mirrors to depotcache &amp; config/depotcache, and syncs setManifestid() pins
                 </p>
               </div>
 
@@ -539,6 +582,20 @@ export function ImportModal({
                 {replaceCount === 1 ? '' : 's'} will be backed up before replacement.
               </span>
             </div>
+          )}
+
+          {staged.length > 0 && (
+            <label className="flex items-center gap-2.5 p-3 rounded-xl bg-indigo-500/10 border border-indigo-500/20 text-xs text-indigo-200 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={syncLuaDirectives}
+                onChange={(e) => setSyncLuaDirectives(e.target.checked)}
+                className="rounded border-indigo-500/40 bg-black/40 text-indigo-500"
+              />
+              <span>
+                Auto-pin <span className="font-mono">setManifestid()</span> in <span className="font-mono">.lua</span>, dual-mirror to <span className="font-mono">config/depotcache</span> &amp; vault (prevents Steam &quot;No internet connection&quot;)
+              </span>
+            </label>
           )}
 
           {duplicateCount > 0 && (

@@ -11,7 +11,11 @@ import {
 } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { isDesktopElectron, lunexClient } from '../lib/client';
-import type { DirectoryStatus, LunexSettings } from '../types/lunex';
+import type {
+  DirectoryStatus,
+  LunexSettings,
+  SteamEnvironmentStatus,
+} from '../types/lunex';
 
 interface SettingsViewProps {
   settings: LunexSettings;
@@ -21,6 +25,7 @@ interface SettingsViewProps {
     manifest: DirectoryStatus;
     backup: DirectoryStatus;
   };
+  steamEnvironment?: SteamEnvironmentStatus;
   platform: string;
   backupCount: number;
   onSaveSettings: (partial: Partial<LunexSettings>) => Promise<void>;
@@ -30,6 +35,7 @@ interface SettingsViewProps {
 export function SettingsView({
   settings,
   directories,
+  steamEnvironment,
   platform,
   backupCount,
   onSaveSettings,
@@ -138,6 +144,76 @@ export function SettingsView({
             <span>{saving ? 'Saving...' : 'Save Changes'}</span>
           </button>
         </div>
+
+        {/* Section 0: Steam Environment Health */}
+        {steamEnvironment && (
+          <section className="rounded-2xl bg-[#121621] border border-white/[0.07] p-5 space-y-3">
+            <div className="flex items-center justify-between gap-2 flex-wrap">
+              <div>
+                <h2 className="text-sm font-semibold text-slate-100">
+                  Steam Environment Health
+                </h2>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Live status of Steam process, plugins, hosts file, offline mode, and dual depotcache mirroring
+                </p>
+              </div>
+              <span
+                className={clsx(
+                  'px-2.5 py-1 rounded-full text-[11px] font-medium border',
+                  steamEnvironment.steamRunning
+                    ? 'bg-emerald-500/12 text-emerald-300 border-emerald-500/25'
+                    : 'bg-slate-500/15 text-slate-300 border-slate-500/25'
+                )}
+              >
+                Steam {steamEnvironment.steamRunning ? 'Running' : 'Closed'}
+              </span>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5 text-xs">
+              <div className="p-3 rounded-xl bg-[#0B0E16] border border-white/[0.06]">
+                <div className="text-[11px] text-slate-400">Plugin Loader</div>
+                <div className="mt-1 font-medium text-slate-200">
+                  {steamEnvironment.pluginDetected
+                    ? `Detected (${steamEnvironment.pluginFiles.join(', ')})`
+                    : 'Not detected (ensure SteamTools / HID.dll is installed)'}
+                </div>
+              </div>
+
+              <div className="p-3 rounded-xl bg-[#0B0E16] border border-white/[0.06]">
+                <div className="text-[11px] text-slate-400">Network / Offline Flags</div>
+                <div className="mt-1 font-medium text-slate-200">
+                  {steamEnvironment.hostsBlockingSteam.length > 0
+                    ? `Blocked in hosts (${steamEnvironment.hostsBlockingSteam.length} domain(s))`
+                    : steamEnvironment.offlineModeConfigured
+                      ? 'Offline Mode Enabled (steam.cfg / loginusers.vdf)'
+                      : 'No Steam hosts blocks or offline flags'}
+                </div>
+              </div>
+            </div>
+
+            {steamEnvironment.steamPathMismatch &&
+              steamEnvironment.runningSteamPath && (
+                <div className="p-3 rounded-xl bg-rose-500/12 border border-rose-500/30 flex items-center justify-between gap-3 text-xs">
+                  <span className="text-rose-200">
+                    Running Steam is at{' '}
+                    <span className="font-mono">
+                      {steamEnvironment.runningSteamPath}
+                    </span>{' '}
+                    which differs from Lunex&apos;s configured Steam path!
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setSteamPath(steamEnvironment.runningSteamPath ?? '')
+                    }
+                    className="px-2.5 py-1 rounded-lg bg-rose-500/25 hover:bg-rose-500/35 text-rose-100 font-medium shrink-0 cursor-pointer"
+                  >
+                    Use Running Path
+                  </button>
+                </div>
+              )}
+          </section>
+        )}
 
         {/* Section 1: Directories */}
         <section className="rounded-2xl bg-[#121621] border border-white/[0.07] p-5 space-y-5">

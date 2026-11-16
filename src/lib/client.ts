@@ -1,8 +1,11 @@
 import type {
   ImportFileOutcome,
   IncomingFilePayload,
+  LiveSteamAppInfo,
   LunexSettings,
   ManifestInspection,
+  RepairInstallOptions,
+  RepairInstallResult,
   SystemState,
   ValidationResult,
 } from '../types/lunex';
@@ -12,9 +15,19 @@ interface LunexElectronBridge {
   getState: () => Promise<SystemState>;
   rescan: () => Promise<SystemState>;
   validateFiles: (files: IncomingFilePayload[]) => Promise<ValidationResult[]>;
+  unpackZip: (files: IncomingFilePayload[]) => Promise<IncomingFilePayload[]>;
+  repairInstall: (
+    appId: string,
+    options?: RepairInstallOptions
+  ) => Promise<RepairInstallResult>;
+  checkLiveAppInfo: (
+    appId: string
+  ) => Promise<{ liveInfo: LiveSteamAppInfo; state: SystemState }>;
+  launchSteamInstall: (appId: string) => Promise<boolean>;
+  openSteamConsole: () => Promise<boolean>;
   importFiles: (
     files: IncomingFilePayload[],
-    options?: { allowReplaceDuplicates?: boolean }
+    options?: { allowReplaceDuplicates?: boolean; syncLuaDirectives?: boolean }
   ) => Promise<{ outcomes: ImportFileOutcome[]; state: SystemState }>;
   associateManifest: (filePath: string, appId: string) => Promise<SystemState>;
   deleteManifest: (filePath: string) => Promise<SystemState>;
@@ -72,9 +85,67 @@ export const lunexClient = {
     });
   },
 
+  unpackZip(files: IncomingFilePayload[]): Promise<IncomingFilePayload[]> {
+    if (window.lunexElectron) return window.lunexElectron.unpackZip(files);
+    return apiFetch<IncomingFilePayload[]>('/api/unpack-zip', {
+      method: 'POST',
+      body: JSON.stringify({ files }),
+    });
+  },
+
+  repairInstall(
+    appId: string,
+    options?: RepairInstallOptions
+  ): Promise<RepairInstallResult> {
+    if (window.lunexElectron) {
+      return window.lunexElectron.repairInstall(appId, options);
+    }
+    return apiFetch<RepairInstallResult>('/api/repair-install', {
+      method: 'POST',
+      body: JSON.stringify({ appId, options }),
+    });
+  },
+
+  checkLiveAppInfo(
+    appId: string
+  ): Promise<{ liveInfo: LiveSteamAppInfo; state: SystemState }> {
+    if (window.lunexElectron) {
+      return window.lunexElectron.checkLiveAppInfo(appId);
+    }
+    return apiFetch<{ liveInfo: LiveSteamAppInfo; state: SystemState }>(
+      '/api/live-app-info',
+      {
+        method: 'POST',
+        body: JSON.stringify({ appId }),
+      }
+    );
+  },
+
+  async launchSteamInstall(appId: string): Promise<boolean> {
+    if (window.lunexElectron) {
+      return window.lunexElectron.launchSteamInstall(appId);
+    }
+    if (typeof window !== 'undefined') {
+      window.open(`steam://install/${appId}`, '_self');
+      return true;
+    }
+    return false;
+  },
+
+  async openSteamConsole(): Promise<boolean> {
+    if (window.lunexElectron) {
+      return window.lunexElectron.openSteamConsole();
+    }
+    if (typeof window !== 'undefined') {
+      window.open('steam://open/console', '_self');
+      return true;
+    }
+    return false;
+  },
+
   importFiles(
     files: IncomingFilePayload[],
-    options?: { allowReplaceDuplicates?: boolean }
+    options?: { allowReplaceDuplicates?: boolean; syncLuaDirectives?: boolean }
   ): Promise<{ outcomes: ImportFileOutcome[]; state: SystemState }> {
     if (window.lunexElectron) {
       return window.lunexElectron.importFiles(files, options);

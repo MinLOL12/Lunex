@@ -3,7 +3,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LunexManager } from './core/lunexManager.js';
-import type { IncomingFilePayload, LunexSettings } from './core/types.js';
+import type {
+  IncomingFilePayload,
+  LunexSettings,
+  RepairInstallOptions,
+} from './core/types.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -70,12 +74,33 @@ app.whenReady().then(() => {
   ipcMain.handle('lunex:validateFiles', (_e, files: IncomingFilePayload[]) =>
     manager.validateIncomingFiles(files)
   );
+  ipcMain.handle('lunex:unpackZip', (_e, files: IncomingFilePayload[]) =>
+    manager.unpackZipFiles(files)
+  );
+  ipcMain.handle(
+    'lunex:repairInstall',
+    (_e, appId: string, options?: RepairInstallOptions) =>
+      manager.repairGameInstall(appId, options)
+  );
+  ipcMain.handle('lunex:checkLiveAppInfo', (_e, appId: string) =>
+    manager.checkLiveAppInfo(appId)
+  );
+  ipcMain.handle('lunex:launchSteamInstall', async (_e, appId: string) => {
+    const cleanId = appId.trim();
+    if (!/^\d+$/.test(cleanId)) return false;
+    await shell.openExternal(`steam://install/${cleanId}`);
+    return true;
+  });
+  ipcMain.handle('lunex:openSteamConsole', async () => {
+    await shell.openExternal('steam://open/console');
+    return true;
+  });
   ipcMain.handle(
     'lunex:importFiles',
     (
       _e,
       files: IncomingFilePayload[],
-      options?: { allowReplaceDuplicates?: boolean }
+      options?: { allowReplaceDuplicates?: boolean; syncLuaDirectives?: boolean }
     ) => manager.importFiles(files, options)
   );
   ipcMain.handle(

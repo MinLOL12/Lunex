@@ -3,6 +3,7 @@ import {
   Gamepad2,
   Plus,
   Search,
+  ShieldAlert,
   SlidersHorizontal,
   X,
 } from 'lucide-react';
@@ -17,6 +18,7 @@ interface LibraryViewProps {
   onManageManifests: (appId: string) => void;
   onImportForGame: (appId: string) => void;
   onRemoveManualGame: (appId: string) => void;
+  onDiagnoseGame: (game: SteamGame) => void;
 }
 
 type StatusFilter = 'all' | 'installed' | 'manifest' | 'manual';
@@ -29,11 +31,17 @@ export function LibraryView({
   onManageManifests,
   onImportForGame,
   onRemoveManualGame,
+  onDiagnoseGame,
 }: LibraryViewProps) {
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [sortBy, setSortBy] = useState<SortMode>('status');
   const searchInputRef = useRef<HTMLInputElement>(null);
+
+  const blockedGames = useMemo(
+    () => games.filter((g) => g.installDiagnostics?.status === 'blocked'),
+    [games]
+  );
 
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
@@ -212,7 +220,30 @@ export function LibraryView({
       </div>
 
       {/* Grid Content */}
-      <div className="flex-1 overflow-y-auto p-6">
+      <div className="flex-1 overflow-y-auto p-6 space-y-4">
+        {blockedGames.length > 0 && (
+          <div className="p-3.5 rounded-2xl bg-rose-500/10 border border-rose-500/25 flex flex-wrap items-center justify-between gap-3">
+            <div className="flex items-start gap-2.5 min-w-0">
+              <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <div className="text-xs">
+                <span className="font-semibold text-rose-200">
+                  {blockedGames.length} game{blockedGames.length === 1 ? '' : 's'} ha
+                  {blockedGames.length === 1 ? 's' : 've'} Steam install blockers
+                </span>
+                <p className="text-slate-400 mt-0.5">
+                  Missing/pruned <span className="font-mono">.manifest</span> files, unsynced <span className="font-mono">config.vdf</span> keys, commented <span className="font-mono">setManifestid()</span>, or stuck Steam caches cause &quot;No internet connection&quot; errors.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => onDiagnoseGame(blockedGames[0])}
+              className="px-3 py-1.5 rounded-xl text-xs font-medium bg-rose-500/20 hover:bg-rose-500/30 text-rose-100 border border-rose-500/30 transition-colors shrink-0 cursor-pointer"
+            >
+              Diagnose &amp; Fix ({blockedGames[0].name})
+            </button>
+          </div>
+        )}
         {filteredGames.length === 0 ? (
           <div className="h-64 flex flex-col items-center justify-center text-center max-w-md mx-auto">
             <div className="w-12 h-12 rounded-2xl bg-[#141824] border border-white/[0.07] flex items-center justify-center text-slate-500 mb-3">
@@ -257,6 +288,7 @@ export function LibraryView({
                 onManageManifests={onManageManifests}
                 onImportForGame={onImportForGame}
                 onRemoveManualGame={onRemoveManualGame}
+                onDiagnoseGame={onDiagnoseGame}
               />
             ))}
           </div>
