@@ -2,6 +2,7 @@ import { Upload } from 'lucide-react';
 import { useCallback, useEffect, useState } from 'react';
 import { AddGameModal } from './components/AddGameModal';
 import { ImportModal } from './components/ImportModal';
+import { InstallDiagnosticsModal } from './components/InstallDiagnosticsModal';
 import { ManifestDetailModal } from './components/ManifestDetailModal';
 import { OperationsLogPanel } from './components/OperationsLogPanel';
 import { Sidebar } from './components/Sidebar';
@@ -13,6 +14,7 @@ import type {
   LunexSettings,
   ManagedManifest,
   NavSection,
+  RepairInstallResult,
   SystemState,
   ToastItem,
 } from './types/lunex';
@@ -41,6 +43,9 @@ export default function App() {
   );
   const [inspectedManifest, setInspectedManifest] =
     useState<ManagedManifest | null>(null);
+  const [diagnosedGameAppId, setDiagnosedGameAppId] = useState<string | null>(
+    null
+  );
   const [opsPanelOpen, setOpsPanelOpen] = useState(false);
   const [opsPanelTab, setOpsPanelTab] = useState<'operations' | 'backups'>(
     'operations'
@@ -90,7 +95,8 @@ export default function App() {
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
-        if (inspectedManifest) setInspectedManifest(null);
+        if (diagnosedGameAppId) setDiagnosedGameAppId(null);
+        else if (inspectedManifest) setInspectedManifest(null);
         else if (importOpen) setImportOpen(false);
         else if (addGameOpen) setAddGameOpen(false);
         else if (opsPanelOpen) setOpsPanelOpen(false);
@@ -98,7 +104,13 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [inspectedManifest, importOpen, addGameOpen, opsPanelOpen]);
+  }, [
+    diagnosedGameAppId,
+    inspectedManifest,
+    importOpen,
+    addGameOpen,
+    opsPanelOpen,
+  ]);
 
   const handleRescan = async () => {
     setIsScanning(true);
@@ -153,7 +165,12 @@ export default function App() {
   };
 
   const handleImported = async (outcomes: ImportFileOutcome[]) => {
-    await refreshState();
+    const fresh = await lunexClient.getState().catch(() => null);
+    if (fresh) {
+      setState(fresh);
+    } else {
+      await refreshState();
+    }
     const ok = outcomes.filter(
       (o) => o.status === 'imported' || o.status === 'replaced'
     );
@@ -171,6 +188,32 @@ export default function App() {
           ? `${backedUp} existing file(s) automatically backed up before replacement.`
           : ok.map((o) => o.fileName).join(', ')
       );
+
+      // Check if any affected game has install blockers (e.g. missing .manifest or .lua)
+      if (fresh) {
+        const affectedAppIds = Array.from(
+          new Set(ok.map((o) => o.appId).filter((id): id is string => Boolean(id)))
+        );
+        const blockedGame = fresh.games.find(
+          (g) =>
+            affectedAppIds.includes(g.appId) &&
+            g.installDiagnostics?.status === 'blocked'
+        );
+        if (blockedGame) {
+          pushToast(
+            'warning',
+            `${blockedGame.name}: Install Setup Incomplete`,
+            blockedGame.installDiagnostics!.issues[0]?.title ||
+              'Open Fix Install on the game card before installing in Steam.'
+          );
+        } else if (fresh.steamEnvironment?.needsSteamRestart) {
+          pushToast(
+            'info',
+            'Restart Steam to Apply Imported Manifests',
+            'Steam is currently running and must restart to load newly imported .lua / .manifest files.'
+          );
+        }
+      }
     }
     if (skipped.length > 0) {
       pushToast(
@@ -185,6 +228,25 @@ export default function App() {
         `Rejected ${failed.length} Invalid File${failed.length === 1 ? '' : 's'}`,
         failed[0].message
       );
+    }
+  };
+
+  const handleRepaired = (result: RepairInstallResult) => {
+    setState(result.state);
+    if (result.fixedCount > 0) {
+      pushToast(
+        'success',
+        `Repaired AppID ${result.appId}`,
+        result.actionsTaken[0]
+      );
+    } else if (result.remainingIssues.length > 0) {
+      pushToast(
+        'warning',
+        'Manual Step Required',
+        result.remainingIssues[0].title
+      );
+    } else {
+      pushToast('info', 'No Issues Found', 'All manifest files look ready.');
     }
   };
 
@@ -357,6 +419,7 @@ export default function App() {
               }}
               onImportForGame={(appId) => handleOpenImport(appId)}
               onRemoveManualGame={(appId) => void handleRemoveManualGame(appId)}
+              onDiagnoseGame={(game) => setDiagnosedGameAppId(game.appId)}
             />
           )}
 
@@ -378,6 +441,7 @@ export default function App() {
               onAssociateManifest={handleAssociateManifest}
               onDeleteManifest={handleDeleteManifest}
               onInspectManifest={(mf) => setInspectedManifest(mf)}
+              onDiagnoseGame={(game) => setDiagnosedGameAppId(game.appId)}
             />
           )}
 
@@ -425,11 +489,26 @@ export default function App() {
         initialDroppedFiles={droppedFiles}
         games={state.games}
         autoBackup={state.settings.autoBackup}
+        isSimulatedSteam={state.isSimulatedSteam}
         onClose={() => {
           setImportOpen(false);
           setDroppedFiles(undefined);
         }}
         onImported={(outcomes) => void handleImported(outcomes)}
+        onOpenSettings={() => setActiveSection('settings')}
+      />
+
+      <InstallDiagnosticsModal
+        game={
+          diagnosedGameAppId
+            ? state.games.find((g) => g.appId === diagnosedGameAppId) ?? null
+            : null
+        }
+        isSimulatedSteam={state.isSimulatedSteam}
+        onClose={() => setDiagnosedGameAppId(null)}
+        onRepaired={handleRepaired}
+        onOpenImportForGame={(appId) => handleOpenImport(appId)}
+        onOpenSettings={() => setActiveSection('settings')}
       />
 
       <ManifestDetailModal

@@ -1,12 +1,16 @@
 import clsx from 'clsx';
 import {
+  AlertTriangle,
   Check,
+  CheckCircle2,
   Copy,
   FileCode2,
   FolderCode,
   HardDrive,
+  ShieldAlert,
   Trash2,
   Upload,
+  Wrench,
 } from 'lucide-react';
 import { useState } from 'react';
 import { formatBytes } from '../lib/client';
@@ -17,6 +21,7 @@ interface GameCardProps {
   onManageManifests: (appId: string) => void;
   onImportForGame: (appId: string) => void;
   onRemoveManualGame: (appId: string) => void;
+  onDiagnoseGame: (game: SteamGame) => void;
 }
 
 const PALETTES = [
@@ -86,6 +91,7 @@ export function GameCard({
   onManageManifests,
   onImportForGame,
   onRemoveManualGame,
+  onDiagnoseGame,
 }: GameCardProps) {
   const [imgFailed, setImgFailed] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -98,6 +104,10 @@ export function GameCard({
     `https://shared.cloudflare.steamstatic.com/store_item_assets/steam/apps/${game.appId}/header.jpg`;
 
   const totalManifestFiles = game.luaCount + game.manifestCount;
+  const diag = game.installDiagnostics;
+  const hasBlockingIssue = diag?.status === 'blocked';
+  const hasAttentionIssue = diag?.status === 'needs_attention';
+  const isInstallReady = diag?.status === 'ready';
 
   const handleCopyAppId = async () => {
     try {
@@ -152,10 +162,44 @@ export function GameCard({
         </div>
 
         {/* Manual Tag Top-Left */}
-        {game.isManual && (
+        {game.isManual && !diag && (
           <span className="absolute top-2.5 left-2.5 px-2 py-0.5 rounded-md text-[10px] font-medium bg-black/60 text-slate-300 border border-white/10 backdrop-blur-md">
             Manual Entry
           </span>
+        )}
+
+        {/* Install Diagnostics Pill Top-Left */}
+        {diag && (
+          <button
+            type="button"
+            onClick={() => onDiagnoseGame(game)}
+            className={clsx(
+              'absolute top-2.5 left-2.5 inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium border backdrop-blur-md cursor-pointer transition-colors',
+              hasBlockingIssue
+                ? 'bg-rose-950/80 text-rose-200 border-rose-500/40 hover:bg-rose-900/90'
+                : hasAttentionIssue
+                  ? 'bg-amber-950/80 text-amber-200 border-amber-500/40 hover:bg-amber-900/90'
+                  : 'bg-emerald-950/75 text-emerald-200 border-emerald-500/35 hover:bg-emerald-900/85'
+            )}
+            title="Inspect Steam install readiness"
+          >
+            {hasBlockingIssue ? (
+              <>
+                <ShieldAlert className="w-3 h-3 text-rose-400" />
+                <span>Install Blocked</span>
+              </>
+            ) : hasAttentionIssue ? (
+              <>
+                <AlertTriangle className="w-3 h-3 text-amber-400" />
+                <span>Check Setup</span>
+              </>
+            ) : (
+              <>
+                <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                <span>Steam Ready</span>
+              </>
+            )}
+          </button>
         )}
       </div>
 
@@ -243,15 +287,43 @@ export function GameCard({
               )}
             </button>
 
-            <button
-              type="button"
-              onClick={() => onImportForGame(game.appId)}
-              className="inline-flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-300 border border-indigo-500/25 transition-colors cursor-pointer"
-              title={`Import .lua or .manifest for ${game.name}`}
-            >
-              <Upload className="w-3.5 h-3.5" />
-              <span>Import</span>
-            </button>
+            {diag && (hasBlockingIssue || hasAttentionIssue) ? (
+              <button
+                type="button"
+                onClick={() => onDiagnoseGame(game)}
+                className={clsx(
+                  'inline-flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium border transition-colors cursor-pointer',
+                  hasBlockingIssue
+                    ? 'bg-rose-500/18 hover:bg-rose-500/28 text-rose-200 border-rose-500/30'
+                    : 'bg-amber-500/18 hover:bg-amber-500/28 text-amber-200 border-amber-500/30'
+                )}
+                title="Diagnose & fix why Steam won't install this game"
+              >
+                <Wrench className="w-3.5 h-3.5" />
+                <span>Fix Install</span>
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => onImportForGame(game.appId)}
+                className="inline-flex items-center justify-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-indigo-500/15 hover:bg-indigo-500/25 text-indigo-300 border border-indigo-500/25 transition-colors cursor-pointer"
+                title={`Import .lua or .manifest for ${game.name}`}
+              >
+                <Upload className="w-3.5 h-3.5" />
+                <span>Import</span>
+              </button>
+            )}
+
+            {diag && isInstallReady && (
+              <button
+                type="button"
+                onClick={() => onDiagnoseGame(game)}
+                className="p-1.5 rounded-lg text-emerald-400/80 hover:text-emerald-300 hover:bg-emerald-500/15 border border-transparent hover:border-emerald-500/20 transition-colors cursor-pointer"
+                title="Steam install readiness & launch"
+              >
+                <CheckCircle2 className="w-3.5 h-3.5" />
+              </button>
+            )}
 
             {game.isManual && game.status !== 'installed' && (
               <button

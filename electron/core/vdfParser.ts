@@ -200,3 +200,123 @@ export function parseLibraryFoldersVdf(content: string): string[] {
   }
   return paths;
 }
+
+function escapeVdfString(value: string): string {
+  return value
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\t/g, '\\t');
+}
+
+export function serializeVdf(obj: VdfObject, depth = 0): string {
+  const indent = '\t'.repeat(depth);
+  const lines: string[] = [];
+
+  for (const [key, val] of Object.entries(obj)) {
+    if (typeof val === 'string') {
+      lines.push(`${indent}"${escapeVdfString(key)}"\t\t"${escapeVdfString(val)}"`);
+    } else if (val && typeof val === 'object') {
+      lines.push(`${indent}"${escapeVdfString(key)}"`);
+      lines.push(`${indent}{`);
+      lines.push(serializeVdf(val, depth + 1));
+      lines.push(`${indent}}`);
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function findObjectKeyCI(obj: VdfObject, target: string): string | undefined {
+  return Object.keys(obj).find((k) => k.toLowerCase() === target.toLowerCase());
+}
+
+/**
+ * Extracts depot decryption keys from Steam's `config/config.vdf`:
+ *   InstallConfigStore -> Software -> Valve -> Steam -> depots -> <depotId> -> DecryptionKey
+ */
+export function readConfigVdfDepots(configVdfContent: string): Map<string, string> {
+  const result = new Map<string, string>();
+  try {
+    const parsed = parseVdf(configVdfContent);
+    const rootKey = findObjectKeyCI(parsed, 'InstallConfigStore');
+    const root = rootKey ? parsed[rootKey] : undefined;
+    if (!root || typeof root !== 'object') return result;
+
+    const swKey = findObjectKeyCI(root, 'Software');
+    const sw = swKey ? root[swKey] : undefined;
+    if (!sw || typeof sw !== 'object') return result;
+
+    const valveKey = findObjectKeyCI(sw, 'Valve');
+    const valve = valveKey ? sw[valveKey] : undefined;
+    if (!valve || typeof valve !== 'object') return result;
+
+    const steamKey = findObjectKeyCI(valve, 'Steam');
+    const steam = steamKey ? valve[steamKey] : undefined;
+    if (!steam || typeof steam !== 'object') return result;
+
+    const depotsKey = findObjectKeyCI(steam, 'depots');
+    const depots = depotsKey ? steam[depotsKey] : undefined;
+    if (!depots || typeof depots !== 'object') return result;
+
+    for (const [depotId, entry] of Object.entries(depots)) {
+      if (!/^\d+$/.test(depotId) || !entry || typeof entry !== 'object') continue;
+      const decKeyName = findObjectKeyCI(entry, 'DecryptionKey');
+      const decKey = decKeyName ? entry[decKeyName] : undefined;
+      if (typeof decKey === 'string' && decKey.trim()) {
+        result.set(depotId, decKey.trim());
+      }
+    }
+  } catch {
+    // Ignore malformed config.vdf
+  }
+  return result;
+}
+
+/**
+ * Inserts or updates depot decryption keys in Steam's `config/config.vdf`.
+ */
+export function upsertConfigVdfDepotKeys(
+  configVdfContent: string,
+  keys: Record<string, string>
+): { updatedContent: string; addedCount: number } {
+  const parsed = configVdfContent.trim()
+    ? parseVdf(configVdfContent)
+    : ({} as VdfObject);
+
+  const ensureSection = (parent: VdfObject, name: string): VdfObject => {
+    const existingKey = findObjectKeyCI(parent, name);
+    if (existingKey && typeof parent[existingKey] === 'object') {
+      return parent[existingKey] as VdfObject;
+    }
+    const created: VdfObject = {};
+    parent[name] = created;
+    return created;
+  };
+
+  const root = ensureSection(parsed, 'InstallConfigStore');
+  const sw = ensureSection(root, 'Software');
+  const valve = ensureSection(sw, 'Valve');
+  const steam = ensureSection(valve, 'Steam');
+  const depots = ensureSection(steam, 'depots');
+
+  let addedCount = 0;
+  for (const [depotId, decKey] of Object.entries(keys)) {
+    const cleanDepot = depotId.trim();
+    const cleanKey = decKey.trim();
+    if (!/^\d+$/.test(cleanDepot) || !cleanKey) continue;
+
+    const depotSection = ensureSection(depots, cleanDepot);
+    const existingKeyField = findObjectKeyCI(depotSection, 'DecryptionKey');
+    const currentVal = existingKeyField ? depotSection[existingKeyField] : undefined;
+    if (currentVal !== cleanKey) {
+      depotSection[existingKeyField ?? 'DecryptionKey'] = cleanKey;
+      addedCount++;
+    }
+  }
+
+  return {
+    updatedContent: serializeVdf(parsed) + '\n',
+    addedCount,
+  };
+}

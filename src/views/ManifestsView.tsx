@@ -10,6 +10,7 @@ import {
   Search,
   Trash2,
   Upload,
+  Wrench,
   X,
   XCircle,
 } from 'lucide-react';
@@ -40,6 +41,7 @@ interface ManifestsViewProps {
   onAssociateManifest: (filePath: string, appId: string) => Promise<void>;
   onDeleteManifest: (filePath: string) => Promise<void>;
   onInspectManifest: (manifest: ManagedManifest) => void;
+  onDiagnoseGame: (game: SteamGame) => void;
 }
 
 type TypeFilter = 'all' | 'lua' | 'manifest' | 'issues';
@@ -58,6 +60,7 @@ export function ManifestsView({
   onAssociateManifest,
   onDeleteManifest,
   onInspectManifest,
+  onDiagnoseGame,
 }: ManifestsViewProps) {
   const [query, setQuery] = useState('');
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
@@ -72,7 +75,9 @@ export function ManifestsView({
     [manifests]
   );
   const issuesCount = useMemo(
-    () => manifests.filter((m) => !m.isValid || m.isDuplicate).length,
+    () =>
+      manifests.filter((m) => !m.isValid || m.isDuplicate || m.isZipWrapped)
+        .length,
     [manifests]
   );
 
@@ -82,7 +87,8 @@ export function ManifestsView({
       if (selectedAppIdFilter && m.appId !== selectedAppIdFilter) return false;
       if (typeFilter === 'lua' && m.fileType !== 'lua') return false;
       if (typeFilter === 'manifest' && m.fileType !== 'manifest') return false;
-      if (typeFilter === 'issues' && m.isValid && !m.isDuplicate) return false;
+      if (typeFilter === 'issues' && m.isValid && !m.isDuplicate && !m.isZipWrapped)
+        return false;
 
       if (!q) return true;
       return (
@@ -157,6 +163,14 @@ export function ManifestsView({
               <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-rose-500/15 text-rose-300 border border-rose-500/25">
                 <XCircle className="w-3 h-3" />
                 Invalid
+              </span>
+            ) : mf.isZipWrapped ? (
+              <span
+                className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-amber-500/15 text-amber-300 border border-amber-500/25"
+                title="ZIP-wrapped .manifest file — Steam requires raw 0x71F617D0 binary"
+              >
+                <AlertTriangle className="w-3 h-3" />
+                ZIP-Wrapped
               </span>
             ) : mf.isDuplicate ? (
               <span
@@ -442,31 +456,52 @@ export function ManifestsView({
             </div>
           </div>
         ) : groupByGame ? (
-          grouped.map((group) => (
-            <div
-              key={group.appId}
-              className="rounded-2xl bg-[#121621] border border-white/[0.07] overflow-hidden"
-            >
-              <div className="px-4 py-2.5 bg-[#161B28] border-b border-white/[0.06] flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2 min-w-0">
-                  <span className="text-xs font-semibold text-slate-100 truncate">
-                    {group.title}
-                  </span>
-                  {group.appId !== 'unassigned' && (
-                    <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-white/[0.06] text-slate-300">
-                      AppID {group.appId}
+          grouped.map((group) => {
+            const matchedGame = games.find((g) => g.appId === group.appId);
+            const diag = matchedGame?.installDiagnostics;
+            return (
+              <div
+                key={group.appId}
+                className="rounded-2xl bg-[#121621] border border-white/[0.07] overflow-hidden"
+              >
+                <div className="px-4 py-2.5 bg-[#161B28] border-b border-white/[0.06] flex items-center justify-between gap-2">
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="text-xs font-semibold text-slate-100 truncate">
+                      {group.title}
                     </span>
-                  )}
+                    {group.appId !== 'unassigned' && (
+                      <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-white/[0.06] text-slate-300">
+                        AppID {group.appId}
+                      </span>
+                    )}
+                    {matchedGame && diag && diag.status !== 'ready' && (
+                      <button
+                        type="button"
+                        onClick={() => onDiagnoseGame(matchedGame)}
+                        className={clsx(
+                          'inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium border transition-colors cursor-pointer',
+                          diag.status === 'blocked'
+                            ? 'bg-rose-500/15 text-rose-200 border-rose-500/30 hover:bg-rose-500/25'
+                            : 'bg-amber-500/15 text-amber-200 border-amber-500/30 hover:bg-amber-500/25'
+                        )}
+                      >
+                        <Wrench className="w-3 h-3" />
+                        <span>
+                          {diag.status === 'blocked' ? 'Fix Install Blockers' : 'Check Setup'}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                  <span className="text-[11px] font-mono text-slate-400">
+                    {group.items.length} file{group.items.length === 1 ? '' : 's'}
+                  </span>
                 </div>
-                <span className="text-[11px] font-mono text-slate-400">
-                  {group.items.length} file{group.items.length === 1 ? '' : 's'}
-                </span>
+                <div className="divide-y divide-white/[0.05]">
+                  {group.items.map(renderManifestRow)}
+                </div>
               </div>
-              <div className="divide-y divide-white/[0.05]">
-                {group.items.map(renderManifestRow)}
-              </div>
-            </div>
-          ))
+            );
+          })
         ) : (
           <div className="rounded-2xl bg-[#121621] border border-white/[0.07] divide-y divide-white/[0.05] overflow-hidden">
             {filtered.map(renderManifestRow)}

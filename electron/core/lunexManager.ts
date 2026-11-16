@@ -1,29 +1,51 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { KNOWN_STEAM_TITLES, locateSteamDirectory } from './steamLocator.js';
+import {
+  checkSteamOfflineConfig,
+  detectSteamPlugins,
+  isSteamProcessRunning,
+  KNOWN_STEAM_TITLES,
+  locateSteamDirectory,
+  restartSteamClient,
+} from './steamLocator.js';
 import type {
   BackupRecord,
   DirectoryStatus,
+  ExpectedDepotStatus,
+  GameInstallDiagnostics,
   GameInstallStatus,
   ImportFileOutcome,
   IncomingFilePayload,
+  InstallIssue,
   LunexSettings,
   ManagedManifest,
   ManifestFileType,
   ManifestInspection,
   OperationRecord,
+  ParsedLuaDirective,
+  RepairInstallResult,
+  SteamEnvironmentStatus,
   SteamGame,
   SystemState,
   ValidationResult,
 } from './types.js';
 import {
   computeSha256,
+  extractManifestZipBundle,
   parseLuaDirectives,
   STEAM_MANIFEST_MAGIC,
+  unwrapZipManifestBuffer,
+  upsertLuaManifestDirectives,
   validateManifestBuffer,
+  ZIP_LOCAL_MAGIC,
 } from './validator.js';
-import { parseAppManifestAcf, parseLibraryFoldersVdf } from './vdfParser.js';
+import {
+  parseAppManifestAcf,
+  parseLibraryFoldersVdf,
+  readConfigVdfDepots,
+  upsertConfigVdfDepotKeys,
+} from './vdfParser.js';
 
 interface ManualGameEntry {
   appId: string;
@@ -46,6 +68,11 @@ const DEFAULT_SETTINGS: LunexSettings = {
   launchWithWindows: false,
 };
 
+function normalizePathKey(target: string): string {
+  const resolved = path.resolve(target);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
 export class LunexManager {
   private readonly dataDir: string;
   private readonly isElectron: boolean;
@@ -56,6 +83,7 @@ export class LunexManager {
   private associations: Record<string, string>; // key: normalized filePath or fileName -> appId
   private backups: BackupRecord[];
   private operations: OperationRecord[];
+  private modifiedWhileSteamRunning = false;
 
   constructor(options: LunexManagerOptions) {
     this.dataDir = path.resolve(options.dataDir);
@@ -228,6 +256,38 @@ export class LunexManager {
     };
   }
 
+  private getLibraryRoots(steamPath: string, steamExists: boolean): Set<string> {
+    const libraryRoots = new Set<string>();
+    if (!steamExists) return libraryRoots;
+
+    libraryRoots.add(steamPath);
+    const vdfPath = path.join(steamPath, 'steamapps', 'libraryfolders.vdf');
+    if (fs.existsSync(vdfPath)) {
+      try {
+        const content = fs.readFileSync(vdfPath, 'utf8');
+        for (const libPath of parseLibraryFoldersVdf(content)) {
+          if (fs.existsSync(libPath)) {
+            libraryRoots.add(path.resolve(libPath));
+          }
+        }
+      } catch {
+        // Ignore malformed libraryfolders.vdf
+      }
+    }
+    return libraryRoots;
+  }
+
+  private readConfigVdfKeys(steamPath: string): Map<string, string> {
+    const configPath = path.join(steamPath, 'config', 'config.vdf');
+    if (!fs.existsSync(configPath)) return new Map();
+    try {
+      const raw = fs.readFileSync(configPath, 'utf8');
+      return readConfigVdfDepots(raw);
+    } catch {
+      return new Map();
+    }
+  }
+
   private tryReadLocalSteamIcon(steamRoot: string, appId: string): string | undefined {
     const candidates = [
       path.join(steamRoot, 'appcache', 'librarycache', `${appId}_icon.jpg`),
@@ -252,36 +312,61 @@ export class LunexManager {
 
   /**
    * Scans Steam libraries, managed .lua & .manifest directories, and manual entries
-   * to return the complete, synchronized SystemState.
+   * to return the complete, synchronized SystemState with per-game install diagnostics.
    */
   public getState(): SystemState {
     const dirs = this.resolveDirectories();
     const gamesMap = new Map<string, SteamGame>();
     const depotToAppId = new Map<string, string>();
+    const stuckDownloadApps = new Set<string>();
 
-    // 1. Discover Steam library folders via libraryfolders.vdf + root steamapps
-    const libraryRoots = new Set<string>();
-    if (dirs.steam.exists) {
-      libraryRoots.add(dirs.steam.path);
-      const vdfPath = path.join(dirs.steam.path, 'steamapps', 'libraryfolders.vdf');
-      if (fs.existsSync(vdfPath)) {
-        try {
-          const content = fs.readFileSync(vdfPath, 'utf8');
-          for (const libPath of parseLibraryFoldersVdf(content)) {
-            if (fs.existsSync(libPath)) {
-              libraryRoots.add(path.resolve(libPath));
-            }
-          }
-        } catch {
-          // Ignore malformed libraryfolders.vdf
-        }
-      }
+    const steamRunning = !dirs.isSimulatedSteam && isSteamProcessRunning();
+    if (!steamRunning) {
+      this.modifiedWhileSteamRunning = false;
     }
 
-    // 2. Parse appmanifest_*.acf in each Steam library folder
+    const pluginCheck = dirs.steam.exists
+      ? detectSteamPlugins(dirs.steam.path)
+      : { detected: false, files: [] };
+
+    const steamEnvironment: SteamEnvironmentStatus = {
+      steamRunning,
+      pluginDetected: pluginCheck.detected,
+      pluginFiles: pluginCheck.files,
+      luaDirInSteam:
+        normalizePathKey(dirs.lua.path) ===
+        normalizePathKey(path.join(dirs.steam.path, 'config', 'stplug-in')),
+      manifestDirInSteam:
+        normalizePathKey(dirs.manifest.path) ===
+        normalizePathKey(path.join(dirs.steam.path, 'depotcache')),
+      offlineModeConfigured:
+        dirs.steam.exists && checkSteamOfflineConfig(dirs.steam.path),
+      needsSteamRestart: this.modifiedWhileSteamRunning && steamRunning,
+    };
+
+    // 1. Discover Steam library folders via libraryfolders.vdf + root steamapps
+    const libraryRoots = this.getLibraryRoots(dirs.steam.path, dirs.steam.exists);
+
+    // 2. Parse appmanifest_*.acf and check stuck download staging folders
     for (const libRoot of libraryRoots) {
       const steamapps = path.join(libRoot, 'steamapps');
       if (!fs.existsSync(steamapps)) continue;
+
+      for (const stagingName of ['downloading', 'temp']) {
+        const stagingDir = path.join(steamapps, stagingName);
+        if (fs.existsSync(stagingDir)) {
+          try {
+            for (const item of fs.readdirSync(stagingDir)) {
+              if (/^\d+$/.test(item)) {
+                stuckDownloadApps.add(item);
+              }
+            }
+          } catch {
+            // Ignore unreadable staging folder
+          }
+        }
+      }
+
       let entries: string[] = [];
       try {
         entries = fs.readdirSync(steamapps);
@@ -297,10 +382,24 @@ export class LunexManager {
           if (!parsed) continue;
 
           // StateFlags === 4 indicates fully installed; bit 2 indicates update required
-          const isFullyInstalled = parsed.stateFlags === 4 || (parsed.stateFlags & 4) === 4 && (parsed.stateFlags & 2) === 0;
+          const isFullyInstalled =
+            parsed.stateFlags === 4 ||
+            ((parsed.stateFlags & 4) === 4 && (parsed.stateFlags & 2) === 0);
           const status: GameInstallStatus = isFullyInstalled
             ? 'installed'
             : 'update_required';
+
+          // Stuck download detection: incomplete ACF with 0 bytes on disk or queued/downloading state
+          if (
+            !isFullyInstalled &&
+            (parsed.sizeOnDisk === 0 ||
+              (parsed.stateFlags & 1024) !== 0 ||
+              (parsed.stateFlags & 512) !== 0)
+          ) {
+            if (parsed.sizeOnDisk === 0) {
+              stuckDownloadApps.add(parsed.appId);
+            }
+          }
 
           gamesMap.set(parsed.appId, {
             appId: parsed.appId,
@@ -352,6 +451,10 @@ export class LunexManager {
     // 4. Scan Lua files first so we build depotId -> parent AppID mappings
     const rawManifests: ManagedManifest[] = [];
     const shaFirstSeen = new Map<string, string>(); // sha256 -> fileName
+    const luaDirectivesByAppId = new Map<string, ParsedLuaDirective[]>();
+    const manifestsByAppId = new Map<string, ManagedManifest[]>();
+    const depotManifestsByKey = new Map<string, ManagedManifest>(); // `${depotId}_${manifestId}`
+    const depotManifestsByDepot = new Map<string, ManagedManifest[]>();
 
     const scanDirectory = (dirPath: string, expectedExt: '.lua' | '.manifest') => {
       if (!fs.existsSync(dirPath)) return;
@@ -395,6 +498,9 @@ export class LunexManager {
             for (const directive of val.directives) {
               depotToAppId.set(directive.id, resolvedAppId);
             }
+            const existingDirs = luaDirectivesByAppId.get(resolvedAppId) ?? [];
+            existingDirs.push(...val.directives);
+            luaDirectivesByAppId.set(resolvedAppId, existingDirs);
           }
         } else {
           // .manifest: map via explicit override, or depotToAppId from Lua directives, or direct AppID match
@@ -433,7 +539,7 @@ export class LunexManager {
             : 'Verified'
           : val.errors[0] || 'Invalid file';
 
-        rawManifests.push({
+        const mfRecord: ManagedManifest = {
           id: `${expectedExt.slice(1)}:${fileName}`,
           fileName,
           filePath: fullPath,
@@ -449,7 +555,22 @@ export class LunexManager {
           isDuplicate,
           duplicateOf: isDuplicate ? prevFileWithHash : undefined,
           directivesCount: val.directives?.length,
-        });
+          isZipWrapped: val.isZipWrapped,
+        };
+
+        rawManifests.push(mfRecord);
+
+        if (mfRecord.fileType === 'manifest' && mfRecord.depotId) {
+          if (mfRecord.manifestId) {
+            depotManifestsByKey.set(
+              `${mfRecord.depotId}_${mfRecord.manifestId}`,
+              mfRecord
+            );
+          }
+          const byDepot = depotManifestsByDepot.get(mfRecord.depotId) ?? [];
+          byDepot.push(mfRecord);
+          depotManifestsByDepot.set(mfRecord.depotId, byDepot);
+        }
       }
     };
 
@@ -487,7 +608,37 @@ export class LunexManager {
           }
         }
         mf.gameName = game.name;
+
+        const list = manifestsByAppId.get(mf.appId) ?? [];
+        list.push(mf);
+        manifestsByAppId.set(mf.appId, list);
       }
+    }
+
+    // 6. Compute install-readiness diagnostics for games with manifests or stuck queue state
+    const configVdfKeys = dirs.steam.exists
+      ? this.readConfigVdfKeys(dirs.steam.path)
+      : new Map<string, string>();
+
+    for (const game of gamesMap.values()) {
+      const gameManifests = manifestsByAppId.get(game.appId) ?? [];
+      const hasStuck = stuckDownloadApps.has(game.appId);
+      if (gameManifests.length === 0 && !hasStuck) {
+        continue;
+      }
+
+      game.installDiagnostics = this.computeGameDiagnostics({
+        game,
+        gameManifests,
+        luaDirectives: luaDirectivesByAppId.get(game.appId) ?? [],
+        depotManifestsByKey,
+        depotManifestsByDepot,
+        configVdfKeys,
+        hasStuckDownloadState: hasStuck,
+        isSimulatedSteam: dirs.isSimulatedSteam,
+        steamPath: dirs.steam.path,
+        steamEnvironment,
+      });
     }
 
     const games = Array.from(gamesMap.values()).sort((a, b) => {
@@ -523,6 +674,7 @@ export class LunexManager {
       platform: process.platform,
       isElectron: this.isElectron,
       isSimulatedSteam: dirs.isSimulatedSteam,
+      steamEnvironment,
       games,
       manifests: rawManifests,
       backups: [...this.backups],
@@ -530,59 +682,449 @@ export class LunexManager {
     };
   }
 
+  private computeGameDiagnostics(params: {
+    game: SteamGame;
+    gameManifests: ManagedManifest[];
+    luaDirectives: ParsedLuaDirective[];
+    depotManifestsByKey: Map<string, ManagedManifest>;
+    depotManifestsByDepot: Map<string, ManagedManifest[]>;
+    configVdfKeys: Map<string, string>;
+    hasStuckDownloadState: boolean;
+    isSimulatedSteam: boolean;
+    steamPath: string;
+    steamEnvironment: SteamEnvironmentStatus;
+  }): GameInstallDiagnostics {
+    const {
+      game,
+      gameManifests,
+      luaDirectives,
+      depotManifestsByKey,
+      depotManifestsByDepot,
+      configVdfKeys,
+      hasStuckDownloadState,
+      isSimulatedSteam,
+      steamPath,
+      steamEnvironment,
+    } = params;
+
+    const issues: InstallIssue[] = [];
+    const expectedDepots: ExpectedDepotStatus[] = [];
+
+    const luaFiles = gameManifests.filter((m) => m.fileType === 'lua');
+    const depotFiles = gameManifests.filter((m) => m.fileType === 'manifest');
+
+    // 1. Simulated Steam or mismatched custom directories
+    if (isSimulatedSteam) {
+      issues.push({
+        code: 'simulated_steam',
+        severity: 'warning',
+        title: 'Using Workspace Steam Directory',
+        description:
+          'Lunex could not auto-detect a local Steam installation and is using a workspace folder. Set your real Steam path in Settings so Steam sees these manifests.',
+        autoFixable: false,
+      });
+    }
+
+    if (!steamEnvironment.luaDirInSteam || !steamEnvironment.manifestDirInSteam) {
+      issues.push({
+        code: 'custom_dir_mismatch',
+        severity: 'error',
+        title: 'Custom Manifest Path Outside Steam Directory',
+        description:
+          'Custom .lua or .manifest directory points outside your Steam installation. Steam only reads config/stplug-in and depotcache inside its own Steam folder.',
+        autoFixable: false,
+      });
+    }
+
+    // 2. Invalid or ZIP-wrapped or misnamed manifest files
+    for (const mf of gameManifests) {
+      if (!mf.isValid) {
+        issues.push({
+          code: 'invalid_manifest_file',
+          severity: 'error',
+          title: `Invalid File: ${mf.fileName}`,
+          description: mf.validationMessage,
+          autoFixable: false,
+          fileName: mf.fileName,
+        });
+      } else if (mf.isZipWrapped) {
+        issues.push({
+          code: 'zip_wrapped_manifest',
+          severity: 'error',
+          title: `ZIP-Wrapped Depot Manifest: ${mf.fileName}`,
+          description:
+            'This .manifest file is still ZIP-compressed instead of raw 0x71F617D0 binary. Steam fails to read it locally, tries to download from Valve servers, and fails with an internet error.',
+          autoFixable: true,
+          depotId: mf.depotId,
+          manifestId: mf.manifestId,
+          fileName: mf.fileName,
+        });
+      } else if (
+        mf.fileType === 'manifest' &&
+        mf.depotId &&
+        mf.manifestId &&
+        mf.fileName !== `${mf.depotId}_${mf.manifestId}.manifest`
+      ) {
+        issues.push({
+          code: 'misnamed_manifest',
+          severity: 'error',
+          title: `Misnamed Depot Manifest: ${mf.fileName}`,
+          description: `Steam depotcache requires "${mf.depotId}_${mf.manifestId}.manifest". Without this exact filename, Steam tries to fetch the manifest online and fails.`,
+          autoFixable: true,
+          depotId: mf.depotId,
+          manifestId: mf.manifestId,
+          fileName: mf.fileName,
+        });
+      }
+    }
+
+    // 3. Missing .lua script when .manifest files exist
+    if (depotFiles.length > 0 && luaFiles.length === 0) {
+      const anyKeyInVdf = depotFiles.some(
+        (d) => d.depotId && configVdfKeys.has(d.depotId)
+      );
+      issues.push({
+        code: 'missing_lua',
+        severity: 'error',
+        title: 'Missing .lua Script in stplug-in',
+        description:
+          'You imported .manifest file(s), but there is no .lua script in Steam/config/stplug-in. Without addappid() decryption keys and setManifestid(), Steam queues the download and fails with a connection error.',
+        autoFixable: anyKeyInVdf,
+      });
+    }
+
+    // 4. Inspect depots declared in .lua directives
+    const seenDepotIds = new Set<string>();
+    const depotDirectives = luaDirectives.filter(
+      (d) => d.id !== game.appId || Boolean(d.manifestId || d.decryptionKey)
+    );
+
+    for (const dir of depotDirectives) {
+      if (seenDepotIds.has(dir.id)) continue;
+      seenDepotIds.add(dir.id);
+
+      const hasKey = Boolean(dir.decryptionKey) || configVdfKeys.has(dir.id);
+      const exactDiskMatch = dir.manifestId
+        ? depotManifestsByKey.get(`${dir.id}_${dir.manifestId}`)
+        : undefined;
+      const anyDiskForDepot = depotManifestsByDepot.get(dir.id)?.[0];
+      const diskMatch = exactDiskMatch ?? anyDiskForDepot;
+
+      expectedDepots.push({
+        depotId: dir.id,
+        hasDecryptionKey: hasKey,
+        luaManifestId: dir.manifestId,
+        diskManifestFile: diskMatch?.fileName,
+        diskManifestId: diskMatch?.manifestId,
+        isZipWrapped: diskMatch?.isZipWrapped,
+      });
+
+      if (!hasKey) {
+        issues.push({
+          code: 'missing_decryption_key',
+          severity: 'error',
+          title: `Missing Decryption Key for Depot ${dir.id}`,
+          description: `Depot ${dir.id} has no 64-character hex decryption key in the .lua script or config.vdf. Steam cannot decrypt or install this depot without its key.`,
+          autoFixable: false,
+          depotId: dir.id,
+        });
+      }
+
+      if (dir.manifestId && !exactDiskMatch) {
+        if (anyDiskForDepot && anyDiskForDepot.manifestId) {
+          issues.push({
+            code: 'manifest_id_mismatch',
+            severity: 'error',
+            title: `Manifest ID Mismatch for Depot ${dir.id}`,
+            description: `.lua pins setManifestid(${dir.id}, "${dir.manifestId}"), but depotcache has "${anyDiskForDepot.fileName}" (${anyDiskForDepot.manifestId}). Steam fails trying to download the missing manifest online.`,
+            autoFixable: true,
+            depotId: dir.id,
+            manifestId: anyDiskForDepot.manifestId,
+            fileName: anyDiskForDepot.fileName,
+          });
+        } else {
+          issues.push({
+            code: 'missing_depot_manifest',
+            severity: 'error',
+            title: `Missing Depot Manifest: ${dir.id}_${dir.manifestId}.manifest`,
+            description: `The .lua script requires "${dir.id}_${dir.manifestId}.manifest" in Steam/depotcache, but it is missing. This causes Steam to show "Download queued" and then fail with an internet error.`,
+            autoFixable: false,
+            depotId: dir.id,
+            manifestId: dir.manifestId,
+          });
+        }
+      } else if (!dir.manifestId) {
+        if (anyDiskForDepot && anyDiskForDepot.manifestId) {
+          issues.push({
+            code: 'missing_set_manifest_id',
+            severity: 'error',
+            title: `Missing setManifestid() in .lua for Depot ${dir.id}`,
+            description: `"${anyDiskForDepot.fileName}" is in depotcache, but the .lua script lacks setManifestid(${dir.id}, "${anyDiskForDepot.manifestId}", 0). Without it, Steam ignores the local file and fails contacting Valve servers.`,
+            autoFixable: true,
+            depotId: dir.id,
+            manifestId: anyDiskForDepot.manifestId,
+            fileName: anyDiskForDepot.fileName,
+          });
+        } else {
+          issues.push({
+            code: 'missing_depot_manifest',
+            severity: 'warning',
+            title: `No Pinned .manifest File for Depot ${dir.id}`,
+            description: `Depot ${dir.id} in .lua has no setManifestid() and no matching .manifest in depotcache. Steam will attempt to fetch the manifest from Valve servers, which usually fails for unowned depots.`,
+            autoFixable: false,
+            depotId: dir.id,
+          });
+        }
+      }
+    }
+
+    // 5. Check depot .manifest files linked to this game that aren't in .lua yet
+    for (const mf of depotFiles) {
+      if (!mf.depotId || seenDepotIds.has(mf.depotId)) continue;
+      seenDepotIds.add(mf.depotId);
+
+      const hasKey = configVdfKeys.has(mf.depotId);
+      expectedDepots.push({
+        depotId: mf.depotId,
+        hasDecryptionKey: hasKey,
+        diskManifestFile: mf.fileName,
+        diskManifestId: mf.manifestId,
+        isZipWrapped: mf.isZipWrapped,
+      });
+
+      if (luaFiles.length > 0 && mf.manifestId) {
+        issues.push({
+          code: 'missing_set_manifest_id',
+          severity: 'error',
+          title: `Unlinked Depot ${mf.depotId} in .lua`,
+          description: `"${mf.fileName}" is in depotcache, but ${luaFiles[0].fileName} does not include setManifestid(${mf.depotId}, "${mf.manifestId}", 0).`,
+          autoFixable: true,
+          depotId: mf.depotId,
+          manifestId: mf.manifestId,
+          fileName: mf.fileName,
+        });
+      }
+    }
+
+    // 6. Stuck Steam download state (0-byte ACF or leftover downloading/temp files)
+    if (hasStuckDownloadState) {
+      issues.push({
+        code: 'stuck_download_queue',
+        severity: 'error',
+        title: 'Stuck Steam Download Queue / Staging Cache',
+        description: `Steam left behind an incomplete appmanifest_${game.appId}.acf or downloading/${game.appId} cache from a failed attempt. Clearing it lets Steam perform a clean install.`,
+        autoFixable: true,
+      });
+    }
+
+    // 7. Steam Offline mode / missing SteamTools plugin / Steam restart needed
+    if (steamEnvironment.offlineModeConfigured) {
+      issues.push({
+        code: 'steam_offline_mode',
+        severity: 'warning',
+        title: 'Steam Configured for Offline Mode',
+        description:
+          'Steam configuration (steam.cfg or loginusers.vdf) requests Offline Mode, which prevents downloading game chunks.',
+        autoFixable: false,
+      });
+    }
+
+    if (
+      !isSimulatedSteam &&
+      process.platform === 'win32' &&
+      !steamEnvironment.pluginDetected &&
+      luaFiles.length > 0
+    ) {
+      issues.push({
+        code: 'steam_plugin_missing',
+        severity: 'warning',
+        title: 'SteamTools Plugin DLL Not Detected',
+        description: `No Steam plugin DLL (e.g. xinput1_4.dll, hid.dll) was found in ${steamPath}. Unmodified Steam ignores config/stplug-in/*.lua files.`,
+        autoFixable: false,
+      });
+    }
+
+    if (steamEnvironment.needsSteamRestart) {
+      issues.push({
+        code: 'steam_restart_required',
+        severity: 'warning',
+        title: 'Restart Steam to Load Imported Manifests',
+        description:
+          'Manifests were imported or modified while Steam is running. Steam must be restarted so it reloads stplug-in scripts and depotcache files.',
+        autoFixable: this.isElectron,
+      });
+    }
+
+    const hasError = issues.some((i) => i.severity === 'error');
+    const hasWarning = issues.some((i) => i.severity === 'warning');
+
+    return {
+      status: hasError ? 'blocked' : hasWarning ? 'needs_attention' : 'ready',
+      issues,
+      expectedDepots,
+      hasLua: luaFiles.length > 0,
+      hasManifestFiles: depotFiles.length > 0,
+      hasStuckDownloadState,
+      steamRunning: steamEnvironment.steamRunning,
+      pluginDetected: steamEnvironment.pluginDetected,
+    };
+  }
+
+  /**
+   * Unpacks .zip bundles containing .lua and .manifest files into IncomingFilePayload[].
+   */
+  public unpackZipFiles(files: IncomingFilePayload[]): IncomingFilePayload[] {
+    const expanded: IncomingFilePayload[] = [];
+    for (const item of files) {
+      const safeName = path.basename(item.fileName.trim());
+      if (path.extname(safeName).toLowerCase() === '.zip') {
+        const buffer = Buffer.from(item.base64Content, 'base64');
+        const extracted = extractManifestZipBundle(buffer);
+        if (extracted.length > 0) {
+          for (const inner of extracted) {
+            expanded.push({
+              fileName: inner.fileName,
+              base64Content: inner.data.toString('base64'),
+              targetAppId: item.targetAppId,
+            });
+          }
+          continue;
+        }
+      }
+      expanded.push(item);
+    }
+    return expanded;
+  }
+
   /**
    * Pre-validates incoming files without writing them, reporting errors, warnings,
-   * detected AppIDs/depots, and duplicate/replacement status.
+   * detected AppIDs/depots, duplicate/replacement status, and cross-file install readiness.
    */
   public validateIncomingFiles(files: IncomingFilePayload[]): ValidationResult[] {
+    const expandedFiles = this.unpackZipFiles(files);
     const state = this.getState();
     const existingByHash = new Map<string, ManagedManifest>();
     const existingByTarget = new Map<string, ManagedManifest>();
+    const existingDepotFiles = new Set<string>();
+    const existingLuaAppIds = new Set<string>();
 
     for (const mf of state.manifests) {
       existingByHash.set(mf.sha256, mf);
       existingByTarget.set(path.resolve(mf.filePath), mf);
+      if (mf.fileType === 'manifest' && mf.depotId && mf.manifestId) {
+        existingDepotFiles.add(`${mf.depotId}_${mf.manifestId}`);
+      }
+      if (mf.fileType === 'lua' && mf.appId !== 'unassigned') {
+        existingLuaAppIds.add(mf.appId);
+      }
     }
 
-    return files.map((item) => {
+    // First pass: validate individual buffers and collect batch contents
+    const baseResults = expandedFiles.map((item) => {
       const safeName = path.basename(item.fileName.trim());
       const buffer = Buffer.from(item.base64Content, 'base64');
-      const baseResult = validateManifestBuffer(safeName, buffer);
+      return {
+        item,
+        safeName,
+        base: validateManifestBuffer(safeName, buffer),
+      };
+    });
 
+    const batchDepotManifests = new Set<string>();
+    const batchLuaAppIds = new Set<string>();
+    const batchLuaDepotIds = new Set<string>();
+
+    for (const { item, base } of baseResults) {
+      if (!base.valid) continue;
+      if (base.fileType === 'manifest' && base.detectedDepotId && base.detectedManifestId) {
+        batchDepotManifests.add(`${base.detectedDepotId}_${base.detectedManifestId}`);
+      }
+      if (base.fileType === 'lua') {
+        const appId = item.targetAppId?.trim() || base.detectedAppId;
+        if (appId) batchLuaAppIds.add(appId);
+        for (const d of base.directives ?? []) {
+          batchLuaDepotIds.add(d.id);
+        }
+      }
+    }
+
+    return baseResults.map(({ item, safeName, base }) => {
       let duplicateStatus: ValidationResult['duplicateStatus'] = 'none';
       let existingFilePath: string | undefined;
 
-      if (baseResult.fileType !== 'unknown') {
+      if (base.fileType !== 'unknown') {
+        const effectiveName =
+          base.fileType === 'manifest' &&
+          base.detectedDepotId &&
+          base.detectedManifestId &&
+          (base.isZipWrapped || !/^\d+_\d+\.manifest$/i.test(safeName))
+            ? `${base.detectedDepotId}_${base.detectedManifestId}.manifest`
+            : safeName;
+
         const targetDir =
-          baseResult.fileType === 'lua'
+          base.fileType === 'lua'
             ? state.directories.lua.path
             : state.directories.manifest.path;
-        const targetPath = path.resolve(path.join(targetDir, safeName));
+        const targetPath = path.resolve(path.join(targetDir, effectiveName));
 
-        const hashMatch = existingByHash.get(baseResult.sha256);
+        const hashMatch = existingByHash.get(base.sha256);
         const pathMatch = existingByTarget.get(targetPath);
 
         if (hashMatch) {
           duplicateStatus = 'exact_duplicate';
           existingFilePath = hashMatch.filePath;
-          baseResult.warnings.push(
+          base.warnings.push(
             `Identical file content already exists as "${hashMatch.fileName}".`
           );
         } else if (pathMatch) {
           duplicateStatus = 'will_replace';
           existingFilePath = pathMatch.filePath;
-          baseResult.warnings.push(
-            `An existing "${safeName}" will be replaced${this.settings.autoBackup ? ' (automatic backup enabled)' : ''}.`
+          base.warnings.push(
+            `An existing "${effectiveName}" will be replaced${this.settings.autoBackup ? ' (automatic backup enabled)' : ''}.`
           );
         }
       }
 
       if (item.targetAppId && /^\d+$/.test(item.targetAppId.trim())) {
-        baseResult.detectedAppId = item.targetAppId.trim();
+        base.detectedAppId = item.targetAppId.trim();
+      }
+
+      // Cross-file install readiness checks
+      if (base.valid && base.fileType === 'lua') {
+        const missingDepots: string[] = [];
+        for (const d of base.directives ?? []) {
+          if (d.manifestId) {
+            const key = `${d.id}_${d.manifestId}`;
+            if (!existingDepotFiles.has(key) && !batchDepotManifests.has(key)) {
+              missingDepots.push(`${key}.manifest`);
+            }
+          }
+        }
+        if (missingDepots.length > 0) {
+          base.warnings.push(
+            `Missing ${missingDepots.slice(0, 2).join(', ')}${missingDepots.length > 2 ? ` (+${missingDepots.length - 2} more)` : ''} in depotcache — Steam will queue and fail with an internet error until imported.`
+          );
+        }
+      } else if (base.valid && base.fileType === 'manifest' && base.detectedDepotId) {
+        const appId = item.targetAppId?.trim() || base.detectedAppId;
+        const hasLuaOnDisk =
+          (appId && existingLuaAppIds.has(appId)) ||
+          state.manifests.some(
+            (m) => m.fileType === 'lua' && m.appId === appId
+          );
+        const hasLuaInBatch =
+          (appId && batchLuaAppIds.has(appId)) ||
+          batchLuaDepotIds.has(base.detectedDepotId);
+
+        if (!hasLuaOnDisk && !hasLuaInBatch) {
+          base.warnings.push(
+            'No matching .lua script in stplug-in — Steam needs a .lua file with addappid() decryption key and setManifestid() to install.'
+          );
+        }
       }
 
       return {
-        ...baseResult,
+        ...base,
         duplicateStatus,
         existingFilePath,
       };
@@ -638,34 +1180,42 @@ export class LunexManager {
   }
 
   /**
-   * Imports .lua and .manifest files with full validation, duplicate handling,
-   * automatic backup before replacement, and AppID association.
+   * Imports .lua, .manifest (automatically unwrapping ZIP-wrapped DepotManifests),
+   * and .zip bundles with full validation, duplicate handling, automatic backup,
+   * AppID association, and automatic setManifestid() sync in .lua scripts.
    */
   public importFiles(
     files: IncomingFilePayload[],
-    options?: { allowReplaceDuplicates?: boolean }
+    options?: { allowReplaceDuplicates?: boolean; syncLuaDirectives?: boolean }
   ): { outcomes: ImportFileOutcome[]; state: SystemState } {
-    const validations = this.validateIncomingFiles(files);
+    const expandedFiles = this.unpackZipFiles(files);
+    const validations = this.validateIncomingFiles(expandedFiles);
     const dirs = this.resolveDirectories();
     const outcomes: ImportFileOutcome[] = [];
+    const importedManifestSyncTargets: {
+      appId: string;
+      depotId: string;
+      manifestId: string;
+    }[] = [];
+    let wroteAnyFile = false;
 
-    for (let idx = 0; idx < files.length; idx++) {
-      const incoming = files[idx];
+    for (let idx = 0; idx < expandedFiles.length; idx++) {
+      const incoming = expandedFiles[idx];
       const val = validations[idx];
-      const safeName = path.basename(incoming.fileName.trim());
+      const origSafeName = path.basename(incoming.fileName.trim());
 
       if (!val.valid || val.fileType === 'unknown') {
         const reason = val.errors.join(' ') || 'Validation failed.';
         this.recordOperation({
           action: 'import',
           status: 'error',
-          title: `Rejected Invalid File: ${safeName}`,
+          title: `Rejected Invalid File: ${origSafeName}`,
           details: reason,
-          fileName: safeName,
+          fileName: origSafeName,
           appId: incoming.targetAppId || val.detectedAppId,
         });
         outcomes.push({
-          fileName: safeName,
+          fileName: origSafeName,
           status: 'invalid_rejected',
           message: reason,
           validation: val,
@@ -673,21 +1223,30 @@ export class LunexManager {
         continue;
       }
 
+      // Normalize .manifest filename to <depotId>_<manifestId>.manifest if IDs are known
+      const targetFileName =
+        val.fileType === 'manifest' &&
+        val.detectedDepotId &&
+        val.detectedManifestId &&
+        (val.isZipWrapped || !/^\d+_\d+\.manifest$/i.test(origSafeName))
+          ? `${val.detectedDepotId}_${val.detectedManifestId}.manifest`
+          : origSafeName;
+
       if (
         val.duplicateStatus === 'exact_duplicate' &&
         !options?.allowReplaceDuplicates
       ) {
-        const msg = `Skipped duplicate "${safeName}" — identical SHA-256 content already exists.`;
+        const msg = `Skipped duplicate "${targetFileName}" — identical SHA-256 content already exists.`;
         this.recordOperation({
           action: 'import',
           status: 'warning',
-          title: `Duplicate Skipped: ${safeName}`,
+          title: `Duplicate Skipped: ${targetFileName}`,
           details: msg,
-          fileName: safeName,
+          fileName: targetFileName,
           appId: incoming.targetAppId || val.detectedAppId,
         });
         outcomes.push({
-          fileName: safeName,
+          fileName: targetFileName,
           status: 'duplicate_skipped',
           message: msg,
           appId: incoming.targetAppId || val.detectedAppId,
@@ -701,7 +1260,7 @@ export class LunexManager {
 
       try {
         fs.mkdirSync(targetDir, { recursive: true });
-        const targetPath = path.resolve(path.join(targetDir, safeName));
+        const targetPath = path.resolve(path.join(targetDir, targetFileName));
         const existedBefore = fs.existsSync(targetPath);
         let backupRecord: BackupRecord | undefined;
 
@@ -709,7 +1268,7 @@ export class LunexManager {
           incoming.targetAppId?.trim() ||
           val.detectedAppId ||
           this.associations[targetPath] ||
-          this.associations[safeName] ||
+          this.associations[targetFileName] ||
           '';
 
         if (existedBefore && this.settings.autoBackup) {
@@ -722,40 +1281,64 @@ export class LunexManager {
           this.recordOperation({
             action: 'backup',
             status: 'success',
-            title: `Backed Up Existing ${safeName}`,
+            title: `Backed Up Existing ${targetFileName}`,
             details: `Saved backup to ${backupRecord.backupFileName} before replacing.`,
-            fileName: safeName,
+            fileName: targetFileName,
             appId: chosenAppId || undefined,
           });
         }
 
-        const buffer = Buffer.from(incoming.base64Content, 'base64');
+        let buffer: Buffer = Buffer.from(incoming.base64Content, 'base64');
+        let unwrappedNote = '';
+        if (val.fileType === 'manifest' && val.isZipWrapped) {
+          const unwrapped = unwrapZipManifestBuffer(buffer);
+          if (unwrapped) {
+            buffer = Buffer.from(unwrapped.unwrapped);
+            unwrappedNote = ' (unwrapped from ZIP to raw 0x71F617D0 DepotManifest)';
+          }
+        }
+
         fs.writeFileSync(targetPath, buffer);
+        wroteAnyFile = true;
 
         if (chosenAppId && /^\d+$/.test(chosenAppId)) {
           this.associations[targetPath] = chosenAppId;
-          this.associations[safeName] = chosenAppId;
+          this.associations[targetFileName] = chosenAppId;
           this.writeJsonFile('manifest-associations.json', this.associations);
+        }
+
+        if (
+          val.fileType === 'manifest' &&
+          val.detectedDepotId &&
+          val.detectedManifestId
+        ) {
+          importedManifestSyncTargets.push({
+            appId: chosenAppId,
+            depotId: val.detectedDepotId,
+            manifestId: val.detectedManifestId,
+          });
         }
 
         const outcomeStatus = existedBefore ? 'replaced' : 'imported';
         const msg = existedBefore
           ? backupRecord
-            ? `Replaced "${safeName}" (previous version backed up).`
-            : `Replaced "${safeName}".`
-          : `Imported "${safeName}" into ${path.basename(targetDir)}.`;
+            ? `Replaced "${targetFileName}"${unwrappedNote} (previous version backed up).`
+            : `Replaced "${targetFileName}"${unwrappedNote}.`
+          : `Imported "${targetFileName}" into ${path.basename(targetDir)}${unwrappedNote}.`;
 
         this.recordOperation({
           action: 'import',
           status: 'success',
-          title: existedBefore ? `Replaced ${safeName}` : `Imported ${safeName}`,
+          title: existedBefore
+            ? `Replaced ${targetFileName}`
+            : `Imported ${targetFileName}`,
           details: msg,
-          fileName: safeName,
+          fileName: targetFileName,
           appId: chosenAppId || undefined,
         });
 
         outcomes.push({
-          fileName: safeName,
+          fileName: targetFileName,
           status: outcomeStatus,
           message: msg,
           appId: chosenAppId || undefined,
@@ -768,12 +1351,12 @@ export class LunexManager {
         this.recordOperation({
           action: 'import',
           status: 'error',
-          title: `Failed to Import ${safeName}`,
+          title: `Failed to Import ${targetFileName}`,
           details: message,
-          fileName: safeName,
+          fileName: targetFileName,
         });
         outcomes.push({
-          fileName: safeName,
+          fileName: targetFileName,
           status: 'error',
           message,
           validation: val,
@@ -781,9 +1364,358 @@ export class LunexManager {
       }
     }
 
+    // Optional auto-sync of setManifestid() in matching .lua scripts when .manifest files are imported
+    if (options?.syncLuaDirectives && importedManifestSyncTargets.length > 0) {
+      const postState = this.getState();
+      const configVdfKeys = dirs.steam.exists
+        ? this.readConfigVdfKeys(dirs.steam.path)
+        : new Map<string, string>();
+
+      const byAppId = new Map<
+        string,
+        { depotId: string; manifestId: string; decryptionKey?: string }[]
+      >();
+
+      for (const item of importedManifestSyncTargets) {
+        let resolvedAppId = item.appId;
+        if (!resolvedAppId || !/^\d+$/.test(resolvedAppId)) {
+          const matchedMf = postState.manifests.find(
+            (m) =>
+              m.fileType === 'manifest' &&
+              m.depotId === item.depotId &&
+              m.manifestId === item.manifestId
+          );
+          if (matchedMf && matchedMf.appId !== 'unassigned') {
+            resolvedAppId = matchedMf.appId;
+          }
+        }
+        if (!resolvedAppId || !/^\d+$/.test(resolvedAppId)) continue;
+
+        const list = byAppId.get(resolvedAppId) ?? [];
+        list.push({
+          depotId: item.depotId,
+          manifestId: item.manifestId,
+          decryptionKey: configVdfKeys.get(item.depotId),
+        });
+        byAppId.set(resolvedAppId, list);
+      }
+
+      for (const [appId, depotEntries] of byAppId.entries()) {
+        const luaMf =
+          postState.manifests.find(
+            (m) =>
+              m.fileType === 'lua' &&
+              m.appId === appId &&
+              m.fileName.toLowerCase() === `${appId}.lua`
+          ) ??
+          postState.manifests.find(
+            (m) => m.fileType === 'lua' && m.appId === appId
+          );
+
+        if (luaMf && fs.existsSync(luaMf.filePath)) {
+          try {
+            const luaText = fs.readFileSync(luaMf.filePath, 'utf8');
+            const synced = upsertLuaManifestDirectives(
+              luaText,
+              appId,
+              depotEntries
+            );
+            if (synced.changed) {
+              if (this.settings.autoBackup) {
+                this.createBackupForFile(luaMf.filePath, appId, 'lua', 'repair');
+              }
+              fs.writeFileSync(luaMf.filePath, synced.updatedContent, 'utf8');
+              wroteAnyFile = true;
+              this.recordOperation({
+                action: 'repair',
+                status: 'success',
+                title: `Synced setManifestid in ${luaMf.fileName}`,
+                details: `Automatically updated ${depotEntries.map((d) => `${d.depotId}->${d.manifestId}`).join(', ')} in ${luaMf.fileName} so Steam uses local depotcache manifests.`,
+                fileName: luaMf.fileName,
+                appId,
+              });
+            }
+          } catch {
+            // Non-fatal sync failure
+          }
+        }
+      }
+    }
+
+    if (wroteAnyFile && !dirs.isSimulatedSteam && isSteamProcessRunning()) {
+      this.modifiedWhileSteamRunning = true;
+    }
+
     return {
       outcomes,
       state: this.getState(),
+    };
+  }
+
+  /**
+   * Automatically repairs common install blockers for an AppID that cause Steam to
+   * say "Download queued" and then fail with a network/internet error:
+   *  1. Unwraps ZIP-wrapped .manifest files in depotcache to raw 0x71F617D0 binary
+   *  2. Normalizes misnamed .manifest files to <depotId>_<manifestId>.manifest
+   *  3. Syncs setManifestid() & config.vdf keys into <appId>.lua (or creates scaffold)
+   *  4. Clears stuck 0-byte appmanifest_<appId>.acf and steamapps/downloading|temp/<appId>
+   *  5. Syncs depot decryption keys to Steam/config/config.vdf when Steam is closed
+   *  6. Optionally restarts Steam & triggers steam://install/<appId> in Electron
+   */
+  public async repairGameInstall(
+    appId: string,
+    options?: { restartSteam?: boolean }
+  ): Promise<RepairInstallResult> {
+    const cleanAppId = appId.trim();
+    if (!/^\d+$/.test(cleanAppId)) {
+      throw new Error('AppID must be numeric.');
+    }
+
+    const initialState = this.getState();
+    const dirs = this.resolveDirectories();
+    const actionsTaken: string[] = [];
+    const gameManifests = initialState.manifests.filter(
+      (m) => m.appId === cleanAppId
+    );
+    const configVdfKeys = dirs.steam.exists
+      ? this.readConfigVdfKeys(dirs.steam.path)
+      : new Map<string, string>();
+
+    // 1 & 2. Unwrap ZIP-wrapped .manifest files & normalize filenames in depotcache
+    for (const mf of gameManifests) {
+      if (mf.fileType !== 'manifest' || !fs.existsSync(mf.filePath)) continue;
+
+      let buf: Buffer = fs.readFileSync(mf.filePath);
+      let modifiedContent = false;
+
+      if (buf.byteLength >= 4 && buf.readUInt32LE(0) === ZIP_LOCAL_MAGIC) {
+        const unwrapped = unwrapZipManifestBuffer(buf);
+        if (unwrapped) {
+          if (this.settings.autoBackup) {
+            this.createBackupForFile(mf.filePath, cleanAppId, 'manifest', 'repair');
+          }
+          buf = Buffer.from(unwrapped.unwrapped);
+          fs.writeFileSync(mf.filePath, buf);
+          modifiedContent = true;
+          actionsTaken.push(
+            `Unwrapped ZIP-compressed ${mf.fileName} to raw 0x71F617D0 DepotManifest binary.`
+          );
+        }
+      }
+
+      if (mf.depotId && mf.manifestId) {
+        const canonicalName = `${mf.depotId}_${mf.manifestId}.manifest`;
+        const canonicalPath = path.resolve(
+          path.join(dirs.manifest.path, canonicalName)
+        );
+        if (path.resolve(mf.filePath) !== canonicalPath) {
+          if (!modifiedContent && this.settings.autoBackup) {
+            this.createBackupForFile(mf.filePath, cleanAppId, 'manifest', 'repair');
+          }
+          if (!fs.existsSync(canonicalPath)) {
+            fs.renameSync(mf.filePath, canonicalPath);
+            delete this.associations[path.resolve(mf.filePath)];
+            delete this.associations[mf.fileName];
+            this.associations[canonicalPath] = cleanAppId;
+            this.associations[canonicalName] = cleanAppId;
+            this.writeJsonFile('manifest-associations.json', this.associations);
+            actionsTaken.push(
+              `Renamed ${mf.fileName} to canonical Steam depotcache name ${canonicalName}.`
+            );
+          }
+        }
+      }
+    }
+
+    // Re-read manifests after any unwrapping/renaming
+    const midState = this.getState();
+    const updatedManifests = midState.manifests.filter(
+      (m) => m.appId === cleanAppId
+    );
+    const depotEntries = updatedManifests
+      .filter((m) => m.fileType === 'manifest' && m.isValid && m.depotId && m.manifestId)
+      .map((m) => ({
+        depotId: m.depotId!,
+        manifestId: m.manifestId!,
+        decryptionKey: configVdfKeys.get(m.depotId!),
+      }));
+
+    // 3. Sync setManifestid() in existing .lua or scaffold <appId>.lua if keys exist
+    const existingLua =
+      updatedManifests.find(
+        (m) =>
+          m.fileType === 'lua' &&
+          m.fileName.toLowerCase() === `${cleanAppId}.lua`
+      ) ?? updatedManifests.find((m) => m.fileType === 'lua');
+
+    if (existingLua && fs.existsSync(existingLua.filePath) && depotEntries.length > 0) {
+      const luaContent = fs.readFileSync(existingLua.filePath, 'utf8');
+      const synced = upsertLuaManifestDirectives(
+        luaContent,
+        cleanAppId,
+        depotEntries
+      );
+      if (synced.changed) {
+        if (this.settings.autoBackup) {
+          this.createBackupForFile(
+            existingLua.filePath,
+            cleanAppId,
+            'lua',
+            'repair'
+          );
+        }
+        fs.writeFileSync(existingLua.filePath, synced.updatedContent, 'utf8');
+        actionsTaken.push(
+          `Synced setManifestid() directives in ${existingLua.fileName} to match depotcache files.`
+        );
+      }
+    } else if (
+      !existingLua &&
+      depotEntries.length > 0 &&
+      depotEntries.some((d) => Boolean(d.decryptionKey))
+    ) {
+      fs.mkdirSync(dirs.lua.path, { recursive: true });
+      const newLuaPath = path.join(dirs.lua.path, `${cleanAppId}.lua`);
+      const generated = upsertLuaManifestDirectives('', cleanAppId, depotEntries);
+      fs.writeFileSync(newLuaPath, generated.updatedContent, 'utf8');
+      this.associations[path.resolve(newLuaPath)] = cleanAppId;
+      this.associations[`${cleanAppId}.lua`] = cleanAppId;
+      this.writeJsonFile('manifest-associations.json', this.associations);
+      actionsTaken.push(
+        `Created ${cleanAppId}.lua with recovered decryption keys and setManifestid() directives.`
+      );
+    }
+
+    // 4. Clear stuck Steam download staging folders and 0-byte queued ACF files
+    const libraryRoots = this.getLibraryRoots(dirs.steam.path, dirs.steam.exists);
+    for (const libRoot of libraryRoots) {
+      const steamapps = path.join(libRoot, 'steamapps');
+      for (const stagingName of ['downloading', 'temp']) {
+        const target = path.join(steamapps, stagingName, cleanAppId);
+        if (fs.existsSync(target)) {
+          try {
+            fs.rmSync(target, { recursive: true, force: true });
+            actionsTaken.push(
+              `Cleared stale Steam ${stagingName}/${cleanAppId} staging cache.`
+            );
+          } catch {
+            // Ignore locked staging file
+          }
+        }
+      }
+
+      const acfPath = path.join(steamapps, `appmanifest_${cleanAppId}.acf`);
+      if (fs.existsSync(acfPath)) {
+        try {
+          const parsed = parseAppManifestAcf(fs.readFileSync(acfPath, 'utf8'));
+          const isStuck =
+            !parsed ||
+            (parsed.stateFlags !== 4 &&
+              (parsed.sizeOnDisk === 0 ||
+                (parsed.stateFlags & 1024) !== 0 ||
+                (parsed.stateFlags & 512) !== 0));
+          if (isStuck && (!parsed || parsed.sizeOnDisk === 0)) {
+            if (this.settings.autoBackup) {
+              this.createBackupForFile(acfPath, cleanAppId, 'manifest', 'repair');
+            }
+            fs.unlinkSync(acfPath);
+            actionsTaken.push(
+              `Removed stuck 0-byte appmanifest_${cleanAppId}.acf so Steam starts a clean install.`
+            );
+          }
+        } catch {
+          // Ignore ACF read error
+        }
+      }
+    }
+
+    // 5. Optionally restart Steam first if requested, and sync depot keys to config.vdf while Steam is stopped
+    let steamRestarted = false;
+    if (options?.restartSteam && this.isElectron && !dirs.isSimulatedSteam) {
+      steamRestarted = await restartSteamClient(dirs.steam.path, cleanAppId);
+      if (steamRestarted) {
+        this.modifiedWhileSteamRunning = false;
+        actionsTaken.push(
+          `Restarted Steam to reload config/stplug-in & depotcache and queued AppID ${cleanAppId}.`
+        );
+      }
+    }
+
+    const steamStillRunning = !dirs.isSimulatedSteam && isSteamProcessRunning();
+    const configVdfPath = path.join(dirs.steam.path, 'config', 'config.vdf');
+    if (!steamStillRunning && fs.existsSync(configVdfPath)) {
+      const luaForKeys = this.getState().manifests.filter(
+        (m) => m.appId === cleanAppId && m.fileType === 'lua' && fs.existsSync(m.filePath)
+      );
+      const keysToSync: Record<string, string> = {};
+      for (const mf of luaForKeys) {
+        try {
+          const { directives } = parseLuaDirectives(fs.readFileSync(mf.filePath, 'utf8'));
+          for (const d of directives) {
+            if (d.decryptionKey) {
+              keysToSync[d.id] = d.decryptionKey;
+            }
+          }
+        } catch {
+          // Ignore unreadable Lua
+        }
+      }
+
+      if (Object.keys(keysToSync).length > 0) {
+        try {
+          const currentConfig = fs.readFileSync(configVdfPath, 'utf8');
+          const { updatedContent, addedCount } = upsertConfigVdfDepotKeys(
+            currentConfig,
+            keysToSync
+          );
+          if (addedCount > 0) {
+            if (this.settings.autoBackup) {
+              this.createBackupForFile(
+                configVdfPath,
+                cleanAppId,
+                'manifest',
+                'repair'
+              );
+            }
+            fs.writeFileSync(configVdfPath, updatedContent, 'utf8');
+            actionsTaken.push(
+              `Synced ${addedCount} depot decryption key(s) into Steam config/config.vdf.`
+            );
+          }
+        } catch {
+          // Ignore config.vdf write errors
+        }
+      }
+    }
+
+    if (actionsTaken.length > 0) {
+      this.recordOperation({
+        action: 'repair',
+        status: 'success',
+        title: `Repaired Install Setup for AppID ${cleanAppId}`,
+        details: actionsTaken.join(' '),
+        appId: cleanAppId,
+      });
+    } else {
+      this.recordOperation({
+        action: 'repair',
+        status: 'warning',
+        title: `Checked AppID ${cleanAppId} Install Readiness`,
+        details: 'No automatic file repairs were needed; check diagnostics for manual steps.',
+        appId: cleanAppId,
+      });
+    }
+
+    const finalState = this.getState();
+    const gameAfter = finalState.games.find((g) => g.appId === cleanAppId);
+
+    return {
+      appId: cleanAppId,
+      fixedCount: actionsTaken.length,
+      actionsTaken,
+      remainingIssues: gameAfter?.installDiagnostics?.issues ?? [],
+      steamRestarted,
+      state: finalState,
     };
   }
 
@@ -873,6 +1805,11 @@ export class LunexManager {
     delete this.associations[resolved];
     delete this.associations[fileName];
     this.writeJsonFile('manifest-associations.json', this.associations);
+
+    const dirs = this.resolveDirectories();
+    if (!dirs.isSimulatedSteam && isSteamProcessRunning()) {
+      this.modifiedWhileSteamRunning = true;
+    }
 
     this.recordOperation({
       action: 'delete',

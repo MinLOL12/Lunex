@@ -80,11 +80,26 @@ export function lunexApiPlugin(dataDir?: string): Plugin {
         return;
       }
 
+      if (method === 'POST' && pathname === '/api/unpack-zip') {
+        const body = await readJsonBody(req);
+        const files = (body.files as IncomingFilePayload[]) ?? [];
+        sendJson(res, 200, manager.unpackZipFiles(files));
+        return;
+      }
+
+      if (method === 'POST' && pathname === '/api/repair-install') {
+        const body = await readJsonBody(req);
+        const appId = String(body.appId ?? '');
+        const options = body.options as { restartSteam?: boolean } | undefined;
+        sendJson(res, 200, await manager.repairGameInstall(appId, options));
+        return;
+      }
+
       if (method === 'POST' && pathname === '/api/import') {
         const body = await readJsonBody(req);
         const files = (body.files as IncomingFilePayload[]) ?? [];
         const options = body.options as
-          | { allowReplaceDuplicates?: boolean }
+          | { allowReplaceDuplicates?: boolean; syncLuaDirectives?: boolean }
           | undefined;
         sendJson(res, 200, manager.importFiles(files, options));
         return;

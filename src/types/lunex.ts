@@ -4,6 +4,63 @@ export type GameInstallStatus =
   | 'manifest_only'
   | 'not_installed';
 
+export type InstallIssueCode =
+  | 'simulated_steam'
+  | 'custom_dir_mismatch'
+  | 'missing_lua'
+  | 'missing_depot_manifest'
+  | 'missing_set_manifest_id'
+  | 'manifest_id_mismatch'
+  | 'missing_decryption_key'
+  | 'zip_wrapped_manifest'
+  | 'misnamed_manifest'
+  | 'invalid_manifest_file'
+  | 'stuck_download_queue'
+  | 'steam_plugin_missing'
+  | 'steam_offline_mode'
+  | 'steam_restart_required';
+
+export interface InstallIssue {
+  code: InstallIssueCode;
+  severity: 'error' | 'warning' | 'info';
+  title: string;
+  description: string;
+  autoFixable: boolean;
+  depotId?: string;
+  manifestId?: string;
+  fileName?: string;
+}
+
+export interface ExpectedDepotStatus {
+  depotId: string;
+  hasDecryptionKey: boolean;
+  luaManifestId?: string;
+  diskManifestFile?: string;
+  diskManifestId?: string;
+  isZipWrapped?: boolean;
+}
+
+export interface GameInstallDiagnostics {
+  status: 'ready' | 'needs_attention' | 'blocked';
+  issues: InstallIssue[];
+  expectedDepots: ExpectedDepotStatus[];
+  hasLua: boolean;
+  hasManifestFiles: boolean;
+  hasStuckDownloadState: boolean;
+  steamRunning: boolean;
+  pluginDetected: boolean;
+}
+
+export interface SteamEnvironmentStatus {
+  steamRunning: boolean;
+  pluginDetected: boolean;
+  pluginFiles: string[];
+  luaDirInSteam: boolean;
+  manifestDirInSteam: boolean;
+  offlineModeConfigured: boolean;
+  needsSteamRestart: boolean;
+}
+
 export interface SteamGame {
   appId: string;
   name: string;
@@ -17,6 +74,7 @@ export interface SteamGame {
   manifestCount: number;
   linkedDepots: string[];
   localIconDataUrl?: string;
+  installDiagnostics?: GameInstallDiagnostics;
 }
 
 export type ManifestFileType = 'lua' | 'manifest';
@@ -44,6 +102,7 @@ export interface ManagedManifest {
   isDuplicate: boolean;
   duplicateOf?: string;
   directivesCount?: number;
+  isZipWrapped?: boolean;
 }
 
 export interface ValidationResult {
@@ -60,6 +119,7 @@ export interface ValidationResult {
   warnings: string[];
   duplicateStatus: 'none' | 'exact_duplicate' | 'will_replace';
   existingFilePath?: string;
+  isZipWrapped?: boolean;
 }
 
 export interface IncomingFilePayload {
@@ -88,7 +148,7 @@ export interface BackupRecord {
   sizeBytes: number;
   sha256: string;
   createdAt: string;
-  reason: 'replace' | 'delete' | 'manual';
+  reason: 'replace' | 'delete' | 'manual' | 'repair';
 }
 
 export interface OperationRecord {
@@ -104,7 +164,8 @@ export interface OperationRecord {
     | 'remove_game'
     | 'scan'
     | 'settings'
-    | 'associate';
+    | 'associate'
+    | 'repair';
   status: 'success' | 'error' | 'warning';
   title: string;
   details: string;
@@ -140,6 +201,7 @@ export interface SystemState {
   platform: string;
   isElectron: boolean;
   isSimulatedSteam: boolean;
+  steamEnvironment: SteamEnvironmentStatus;
   games: SteamGame[];
   manifests: ManagedManifest[];
   backups: BackupRecord[];
@@ -152,6 +214,15 @@ export interface ManifestInspection {
   directives?: ParsedLuaDirective[];
   hexHeader?: string;
   magicValid?: boolean;
+}
+
+export interface RepairInstallResult {
+  appId: string;
+  fixedCount: number;
+  actionsTaken: string[];
+  remainingIssues: InstallIssue[];
+  steamRestarted: boolean;
+  state: SystemState;
 }
 
 export interface ToastItem {

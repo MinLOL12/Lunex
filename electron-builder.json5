@@ -20,13 +20,16 @@
         "target": "portable",
         "arch": ["x64"]
       }
-    ],
-    "artifactName": "${productName}-${version}-${arch}.${ext}"
+    ]
   },
   "nsis": {
+    "artifactName": "${productName}-${version}-Setup-${arch}.${ext}",
     "oneClick": false,
     "perMachine": false,
     "allowToChangeInstallationDirectory": true,
     "deleteAppDataOnUninstall": false
+  },
+  "portable": {
+    "artifactName": "${productName}-${version}-Portable-${arch}.${ext}"
   }
 }
