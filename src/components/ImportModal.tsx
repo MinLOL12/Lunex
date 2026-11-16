@@ -39,8 +39,10 @@ interface ImportModalProps {
   initialDroppedFiles?: File[];
   games: SteamGame[];
   autoBackup: boolean;
+  isSimulatedSteam?: boolean;
   onClose: () => void;
   onImported: (outcomes: ImportFileOutcome[]) => void;
+  onOpenSettings?: () => void;
 }
 
 export function ImportModal({
@@ -49,8 +51,10 @@ export function ImportModal({
   initialDroppedFiles,
   games,
   autoBackup,
+  isSimulatedSteam,
   onClose,
   onImported,
+  onOpenSettings,
 }: ImportModalProps) {
   const [staged, setStaged] = useState<StagedFile[]>([]);
   const [validating, setValidating] = useState(false);
@@ -130,14 +134,27 @@ export function ImportModal({
     const arr = Array.from(fileList);
     if (arr.length === 0) return;
 
-    const converted: StagedFile[] = await Promise.all(
+    const rawPayloads: IncomingFilePayload[] = await Promise.all(
       arr.map(async (f) => ({
-        id: `${f.name}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
         fileName: f.name,
         base64Content: await fileToBase64(f),
-        targetAppId: defaultAppId || '',
+        targetAppId: defaultAppId || undefined,
       }))
     );
+
+    const hasZip = rawPayloads.some((p) =>
+      p.fileName.toLowerCase().endsWith('.zip')
+    );
+    const expanded = hasZip
+      ? await lunexClient.unpackZip(rawPayloads)
+      : rawPayloads;
+
+    const converted: StagedFile[] = expanded.map((p) => ({
+      id: `${p.fileName}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      fileName: p.fileName,
+      base64Content: p.base64Content,
+      targetAppId: p.targetAppId || defaultAppId || '',
+    }));
 
     const combined = [...staged, ...converted];
     await runValidation(combined);
@@ -196,6 +213,7 @@ export function ImportModal({
       }));
       const res = await lunexClient.importFiles(payloads, {
         allowReplaceDuplicates,
+        syncLuaDirectives: true,
       });
       onImported(res.outcomes);
       onClose();
@@ -302,7 +320,7 @@ export function ImportModal({
                   ref={fileInputRef}
                   type="file"
                   multiple
-                  accept=".lua,.manifest"
+                  accept=".lua,.manifest,.zip"
                   className="hidden"
                   onChange={(e) => {
                     if (e.target.files?.length) {
@@ -315,13 +333,37 @@ export function ImportModal({
                   <FileCheck2 className="w-5 h-5" />
                 </div>
                 <p className="text-xs font-medium text-slate-200">
-                  Drop <span className="font-mono text-indigo-300">.lua</span> or{' '}
-                  <span className="font-mono text-sky-300">.manifest</span> files here, or click to browse
+                  Drop <span className="font-mono text-indigo-300">.lua</span>,{' '}
+                  <span className="font-mono text-sky-300">.manifest</span>, or{' '}
+                  <span className="font-mono text-emerald-300">.zip</span> bundles here, or click to browse
                 </p>
                 <p className="text-[11px] text-slate-500 mt-1">
-                  Checks Valve DepotManifest headers, Lua syntax, SHA-256 duplicates, and AppID directives
+                  Checks Valve DepotManifest headers, unwraps ZIP-compressed manifests, validates Lua directives, and syncs setManifestid()
                 </p>
               </div>
+
+              {isSimulatedSteam && (
+                <div className="flex items-center justify-between gap-3 p-3 rounded-xl bg-amber-500/10 border border-amber-500/25 text-xs text-amber-200">
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                    <span>
+                      Lunex is currently importing into its <strong>Workspace Steam</strong> folder because no local Steam install was auto-detected. Set your real Steam path in Settings for Steam to use these files.
+                    </span>
+                  </div>
+                  {onOpenSettings && (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        onClose();
+                        onOpenSettings();
+                      }}
+                      className="px-2.5 py-1 rounded-lg text-[11px] font-medium bg-amber-500/20 hover:bg-amber-500/30 text-amber-100 shrink-0 cursor-pointer"
+                    >
+                      Settings
+                    </button>
+                  )}
+                </div>
+              )}
 
               {/* Sample Test Bundles in Web Preview */}
               {samples.length > 0 && (
@@ -459,10 +501,17 @@ export function ImportModal({
                           )}
 
                           {val && val.valid && val.warnings.length > 0 && (
-                            <p className="mt-1 flex items-center gap-1.5 text-[11px] text-amber-300">
-                              <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-amber-400" />
-                              <span>{val.warnings[0]}</span>
-                            </p>
+                            <div className="mt-1 space-y-1">
+                              {val.warnings.map((warn, wIdx) => (
+                                <p
+                                  key={wIdx}
+                                  className="flex items-start gap-1.5 text-[11px] text-amber-300"
+                                >
+                                  <AlertTriangle className="w-3.5 h-3.5 shrink-0 text-amber-400 mt-0.5" />
+                                  <span>{warn}</span>
+                                </p>
+                              ))}
+                            </div>
                           )}
 
                           {val && val.valid && val.warnings.length === 0 && (

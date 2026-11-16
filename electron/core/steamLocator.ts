@@ -1,8 +1,9 @@
-import { execSync } from 'node:child_process';
+import { execSync, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { buildValidDepotManifestBuffer } from './validator.js';
+import { parseVdf } from './vdfParser.js';
 
 export const KNOWN_STEAM_TITLES: Record<string, string> = {
   '1091500': 'Cyberpunk 2077',
@@ -51,21 +52,25 @@ function queryWindowsSteamRegistry(): string | null {
   if (process.platform !== 'win32') return null;
 
   const queries = [
-    'reg query "HKCU\\Software\\Valve\\Steam" /v SteamPath',
-    'reg query "HKLM\\SOFTWARE\\WOW6432Node\\Valve\\Steam" /v InstallPath',
-    'reg query "HKLM\\SOFTWARE\\Valve\\Steam" /v InstallPath',
+    { cmd: 'reg query "HKCU\\Software\\Valve\\Steam" /v SteamPath', isExe: false },
+    { cmd: 'reg query "HKCU\\Software\\Valve\\Steam" /v SteamExe', isExe: true },
+    { cmd: 'reg query "HKLM\\SOFTWARE\\WOW6432Node\\Valve\\Steam" /v InstallPath', isExe: false },
+    { cmd: 'reg query "HKLM\\SOFTWARE\\Valve\\Steam" /v InstallPath', isExe: false },
   ];
 
-  for (const cmd of queries) {
+  for (const q of queries) {
     try {
-      const output = execSync(cmd, {
+      const output = execSync(q.cmd, {
         encoding: 'utf8',
         stdio: ['ignore', 'pipe', 'ignore'],
         timeout: 2500,
       });
-      const match = /REG_SZ\s+(.+)$/m.exec(output);
+      const match = /REG_(?:EXPAND_)?SZ\s+(.+)$/m.exec(output);
       if (match && match[1]) {
-        const normalized = path.normalize(match[1].trim());
+        let normalized = path.normalize(match[1].trim());
+        if (q.isExe) {
+          normalized = path.dirname(normalized);
+        }
         if (isValidSteamDirectory(normalized)) {
           return normalized;
         }
@@ -75,6 +80,157 @@ function queryWindowsSteamRegistry(): string | null {
     }
   }
   return null;
+}
+
+export function isSteamProcessRunning(): boolean {
+  try {
+    if (process.platform === 'win32') {
+      const out = execSync('tasklist /FI "IMAGENAME eq steam.exe" /NH', {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        timeout: 1500,
+      });
+      return /steam\.exe/i.test(out);
+    }
+    const cmd = process.platform === 'darwin' ? 'pgrep -x steam_osx' : 'pgrep -x steam';
+    execSync(cmd, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+      timeout: 1500,
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+const STEAM_PLUGIN_DLL_CANDIDATES = [
+  'xinput1_4.dll',
+  'hid.dll',
+  'dwmapi.dll',
+  'version.dll',
+  'winmm.dll',
+  'user32.dll',
+  'dxgi.dll',
+  'SteamTools.dll',
+  'stUI.dll',
+  'core.dll',
+];
+
+export function detectSteamPlugins(steamRoot: string): {
+  detected: boolean;
+  files: string[];
+} {
+  const found: string[] = [];
+  if (!steamRoot || !fs.existsSync(steamRoot)) {
+    return { detected: false, files: [] };
+  }
+  for (const candidate of STEAM_PLUGIN_DLL_CANDIDATES) {
+    try {
+      if (fs.existsSync(path.join(steamRoot, candidate))) {
+        found.push(candidate);
+      }
+    } catch {
+      // Ignore inaccessible files
+    }
+  }
+  return {
+    detected: found.length > 0,
+    files: found,
+  };
+}
+
+export function checkSteamOfflineConfig(steamRoot: string): boolean {
+  try {
+    const steamCfg = path.join(steamRoot, 'steam.cfg');
+    if (fs.existsSync(steamCfg)) {
+      const content = fs.readFileSync(steamCfg, 'utf8');
+      if (/ForceOfflineMode\s*=\s*(1|true|enable)/i.test(content)) {
+        return true;
+      }
+    }
+
+    const loginUsersPath = path.join(steamRoot, 'config', 'loginusers.vdf');
+    if (fs.existsSync(loginUsersPath)) {
+      const parsed = parseVdf(fs.readFileSync(loginUsersPath, 'utf8'));
+      const usersKey = Object.keys(parsed).find(
+        (k) => k.toLowerCase() === 'users'
+      );
+      const users = usersKey ? parsed[usersKey] : undefined;
+      if (users && typeof users === 'object') {
+        for (const entry of Object.values(users)) {
+          if (!entry || typeof entry !== 'object') continue;
+          const mostRecent = Object.entries(entry).find(
+            ([k]) => k.toLowerCase() === 'mostrecent'
+          )?.[1];
+          const wantsOffline = Object.entries(entry).find(
+            ([k]) => k.toLowerCase() === 'wantsofflinemode'
+          )?.[1];
+          if (mostRecent === '1' && wantsOffline === '1') {
+            return true;
+          }
+        }
+      }
+    }
+  } catch {
+    // Ignore malformed Steam config
+  }
+  return false;
+}
+
+export async function restartSteamClient(
+  steamRoot: string,
+  installAppId?: string
+): Promise<boolean> {
+  try {
+    const steamExe =
+      process.platform === 'win32'
+        ? path.join(steamRoot, 'steam.exe')
+        : process.platform === 'darwin'
+          ? '/Applications/Steam.app/Contents/MacOS/steam_osx'
+          : 'steam';
+
+    if (process.platform === 'win32' && !fs.existsSync(steamExe)) {
+      return false;
+    }
+
+    if (isSteamProcessRunning()) {
+      try {
+        if (process.platform === 'win32') {
+          spawn(steamExe, ['-shutdown'], { detached: true, stdio: 'ignore' }).unref();
+        } else {
+          execSync('steam -shutdown', { stdio: 'ignore', timeout: 3000 });
+        }
+      } catch {
+        // Ignore shutdown signal errors
+      }
+
+      // Wait up to 6s for Steam to exit cleanly
+      for (let i = 0; i < 12; i++) {
+        await new Promise((r) => setTimeout(r, 500));
+        if (!isSteamProcessRunning()) break;
+      }
+
+      if (process.platform === 'win32' && isSteamProcessRunning()) {
+        try {
+          execSync('taskkill /F /IM steam.exe', { stdio: 'ignore', timeout: 3000 });
+          await new Promise((r) => setTimeout(r, 750));
+        } catch {
+          // Ignore force kill error
+        }
+      }
+    }
+
+    const args = installAppId ? [`steam://install/${installAppId}`] : [];
+    const child = spawn(steamExe, args, {
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export interface LocatedSteamResult {

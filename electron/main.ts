@@ -70,12 +70,26 @@ app.whenReady().then(() => {
   ipcMain.handle('lunex:validateFiles', (_e, files: IncomingFilePayload[]) =>
     manager.validateIncomingFiles(files)
   );
+  ipcMain.handle('lunex:unpackZip', (_e, files: IncomingFilePayload[]) =>
+    manager.unpackZipFiles(files)
+  );
+  ipcMain.handle(
+    'lunex:repairInstall',
+    (_e, appId: string, options?: { restartSteam?: boolean }) =>
+      manager.repairGameInstall(appId, options)
+  );
+  ipcMain.handle('lunex:launchSteamInstall', async (_e, appId: string) => {
+    const cleanId = appId.trim();
+    if (!/^\d+$/.test(cleanId)) return false;
+    await shell.openExternal(`steam://install/${cleanId}`);
+    return true;
+  });
   ipcMain.handle(
     'lunex:importFiles',
     (
       _e,
       files: IncomingFilePayload[],
-      options?: { allowReplaceDuplicates?: boolean }
+      options?: { allowReplaceDuplicates?: boolean; syncLuaDirectives?: boolean }
     ) => manager.importFiles(files, options)
   );
   ipcMain.handle(

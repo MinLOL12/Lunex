@@ -5,6 +5,11 @@ contextBridge.exposeInMainWorld('lunexElectron', {
   getState: () => ipcRenderer.invoke('lunex:getState'),
   rescan: () => ipcRenderer.invoke('lunex:rescan'),
   validateFiles: (files) => ipcRenderer.invoke('lunex:validateFiles', files),
+  unpackZip: (files) => ipcRenderer.invoke('lunex:unpackZip', files),
+  repairInstall: (appId, options) =>
+    ipcRenderer.invoke('lunex:repairInstall', appId, options),
+  launchSteamInstall: (appId) =>
+    ipcRenderer.invoke('lunex:launchSteamInstall', appId),
   importFiles: (files, options) =>
     ipcRenderer.invoke('lunex:importFiles', files, options),
   associateManifest: (filePath, appId) =>
