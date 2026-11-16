@@ -342,6 +342,7 @@ describe('Steam Install Diagnostics, ZIP Unwrapping, and Auto-Repair', () => {
     const dataDir = makeTempDir();
     const customSteam = path.join(dataDir, 'Steam');
     fs.mkdirSync(path.join(customSteam, 'steamapps'), { recursive: true });
+    fs.writeFileSync(path.join(customSteam, 'xinput1_4.dll'), '');
 
     const manager = new LunexManager({ dataDir });
     manager.updateSettings({ steamPath: customSteam });
@@ -388,6 +389,7 @@ describe('Steam Install Diagnostics, ZIP Unwrapping, and Auto-Repair', () => {
     });
     fs.mkdirSync(luaDir, { recursive: true });
     fs.mkdirSync(depotDir, { recursive: true });
+    fs.writeFileSync(path.join(customSteam, 'xinput1_4.dll'), '');
 
     // Create minimal config.vdf
     fs.writeFileSync(
